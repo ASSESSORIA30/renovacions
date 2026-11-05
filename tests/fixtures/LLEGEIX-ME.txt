@@ -1,0 +1,2 @@
+Documents de PROVA ficticis (no són contractes reals) per provar «Pujar contracte i analitzar» a la Preview.
+Generats amb tests/helpers/retailer-docs.ts. El «contradictori» inclou un annex amb Gala 12 €/MWh contra 10 €/MWh.

@@ -1,0 +1,4 @@
+PDF FICTICIS de prova del lector de factures (cap dada real), generats amb qpdf a partir d'un PDF inventat:
+- protegida-contrasenya.pdf: cal contrasenya per obrir-lo (s'ha de rebutjar amb un missatge clar).
+- restriccions-sense-contrasenya.pdf: només té restriccions de propietari (s'ha de poder llegir).
+La factura de Nufri amb bytes previs es genera a tests/helpers/nufri-invoice.ts.
