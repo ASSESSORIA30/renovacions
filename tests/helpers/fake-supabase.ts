@@ -11,6 +11,7 @@ type Err = { code: string; message: string } | null;
 const UNIQUE: Record<string, string[][]> = {
   ai_opportunities: [["dedupe_key"]],
   crm_tasks: [["rule_key"]],
+  crm_followups: [["activity_id", "fragment_key"]],
   crm_notifications: [["user_id", "rule_key"]],
   ai_recommendations: [["opportunity_id", "input_hash"]],
   ai_automation_logs: [["idempotency_key"]],
@@ -34,10 +35,29 @@ const UNIQUE: Record<string, string[][]> = {
   report_runs: [["kind", "period_key", "recipient_id"]],
   renewal_group_ops: [["id"]],
   activities: [["id"]],
+  comparison_documents: [["comparison_id", "version"], ["comparison_id", "content_hash"]],
+  gana_tariffs: [["gana_id"]],
+  gana_submissions: [["expedient_id"], ["contract_id"]],
+  crm_expedient_destinations: [["expedient_id"]],
+  // 055 · renovacions automàtiques 2.0TD i preus actuals
+  renewal_proposals: [["idempotency_key"]],
+  renewal_automation_runs: [["idempotency_key"]],
+  renewal_automation_jobs: [["idempotency_key"]],
+  renewal_proposal_messages: [["proposal_id", "version"]],
+  renewal_proposal_documents: [["proposal_id", "version"]],
+  renewal_proposal_internal: [["proposal_id"]],
+  renewal_automation_exclusions: [["contract_id"]],
+  crm_current_prices: [["contract_id", "version"]],
+  crm_invoice_price_readings: [["document_id", "sha256"]],
+  // 058 · captació de leads per correu
+  lead_mailboxes: [["address"]],
+  lead_mail_messages: [["mailbox_id", "uidvalidity", "uid"], ["mailbox_id", "message_id"]],
 };
+/** Índexs únics parcials de la 055: una proposta oberta (real) per contracte i una feina en curs per contracte. */
+const OPEN_PROPOSAL = ["preparant", "pendent_validacio", "necessita_revisio", "bloquejada", "validada", "whatsapp_preparat", "enviament_pendent_confirmacio", "enviada", "client_ha_respost", "ajornada"];
 /** Relacions especials: «taula.relació» → clau forana a la fila (una) o a la relació (moltes, invers). */
-const FK_BY_TABLE: Record<string, string> = { "crm_leads.cap_partners": "capture_partner_id", "cap_referral_links.cap_partners": "partner_id", "cap_attributions.cap_partners": "partner_id", "cap_attributions.crm_leads": "lead_id", "cap_invoice_readings.crm_leads": "lead_id" };
-const REVERSE: Record<string, string> = { "cap_submissions.cap_lead_documents": "submission_id", "cap_lead_documents.cap_invoice_readings": "document_id" };
+const FK_BY_TABLE: Record<string, string> = { "crm_leads.cap_partners": "capture_partner_id", "cap_referral_links.cap_partners": "partner_id", "cap_attributions.cap_partners": "partner_id", "cap_attributions.crm_leads": "lead_id", "cap_invoice_readings.crm_leads": "lead_id", "fin_self_invoice_statements.fin_self_invoices": "self_invoice_id", "bill_invoice_statements.bill_invoices": "invoice_id" };
+const REVERSE: Record<string, string> = { "fin_self_invoices.fin_self_invoice_statements": "self_invoice_id", "cap_submissions.cap_lead_documents": "submission_id", "cap_lead_documents.cap_invoice_readings": "document_id" };
 const FK: Record<string, string> = { crm_clients: "client_id", crm_supplies: "supply_id", crm_contracts: "contract_id", crm_expedient_terms: "accepted_terms_id" };
 let seq = 0;
 const uuid = () => `00000000-0000-4000-8000-${(++seq).toString(16).padStart(12, "0")}`;
@@ -63,7 +83,16 @@ export function fakeSupabase(seed: Record<string, Row[]> = {}, rpcs: Record<stri
     for (const m of cols.matchAll(/(\w+)->(\w+)/g)) out[m[2]] = (r[m[1]] as Row | undefined)?.[m[2]] ?? null;
     return out;
   }
-  const like = (v: unknown, pat: string, ci: boolean) => new RegExp(`^${pat.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".")}$`, ci ? "i" : "").test(String(v ?? ""));
+  // LIKE de Postgres: «%» i «_» són comodins i «\\» n'escapa el següent caràcter (058: correus amb «_»)
+  const like = (v: unknown, pat: string, ci: boolean) => {
+    let re = "";
+    for (let i = 0; i < pat.length; i++) {
+      const ch = pat[i];
+      if (ch === "\\" && i + 1 < pat.length) { re += pat[++i].replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); continue; }
+      re += ch === "%" ? ".*" : ch === "_" ? "." : ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+    return new RegExp(`^${re}$`, ci ? "i" : "").test(String(v ?? ""));
+  };
   const parseList = (s: string) => s.replace(/^\(|\)$/g, "").split(",").map((x) => x.trim());
 
   function builder(t: string) {
@@ -95,7 +124,8 @@ export function fakeSupabase(seed: Record<string, Row[]> = {}, rpcs: Record<stri
         return q;
       },
       gte(c: string, v: unknown) { filters.push((r) => r[c] != null && String(r[c]) >= String(v)); return q; },
-      gt(c: string, v: unknown) { filters.push((r) => r[c] != null && Number(r[c]) > Number(v)); return q; },
+      // números com sempre; text no numèric (uuid, codis) per ordre de text, com fa Postgres (cursors de paginació)
+      gt(c: string, v: unknown) { filters.push((r) => r[c] != null && (Number.isNaN(Number(r[c])) && Number.isNaN(Number(v)) && typeof v === "string" && !/^\d{4}-\d{2}-\d{2}/.test(v) ? String(r[c]) > v : Number(r[c]) > Number(v))); return q; },
       lte(c: string, v: unknown) { filters.push((r) => r[c] != null && String(r[c]) <= String(v)); return q; },
       lt(c: string, v: unknown) { filters.push((r) => r[c] != null && String(r[c]) < String(v)); return q; },
       like(c: string, p: string) { filters.push((r) => like(r[c], p, false)); return q; },
@@ -117,12 +147,16 @@ export function fakeSupabase(seed: Record<string, Row[]> = {}, rpcs: Record<stri
     }
     function uniqueViolation(r: Row, exceptId?: unknown): boolean {
       if (t === "ai_analysis_runs" && r.status === "en_curs" && table(t).some((x) => x.status === "en_curs" && x.id !== exceptId)) return true;
+      if (t === "renewal_proposals" && !r.simulation && OPEN_PROPOSAL.includes(String(r.status)) && table(t).some((x) => x.id !== exceptId && x.contract_id === r.contract_id && !x.simulation && OPEN_PROPOSAL.includes(String(x.status)))) return true;
+      if (t === "renewal_automation_jobs" && r.status === "en_curs" && table(t).some((x) => x.id !== exceptId && x.contract_id === r.contract_id && x.status === "en_curs")) return true;
+      if (t === "crm_current_prices" && r.is_current && table(t).some((x) => x.id !== exceptId && x.contract_id === r.contract_id && x.is_current)) return true;
       if (t === "cap_attributions" && r.status === "vigent" && table(t).some((x) => x.status === "vigent" && x.lead_id === r.lead_id && x.id !== exceptId)) return true;
       return (UNIQUE[t] ?? []).some((keys) => keys.every((k) => r[k] != null) && table(t).some((x) => x.id !== exceptId && keys.every((k) => x[k] === r[k])));
     }
     const defaults = (r: Row): Row => {
       const now = new Date().toISOString();
       const base: Row = { id: r.id ?? (t === "crm_automation_runs" || t === "ai_messages" || t === "ai_usage" || t === "opportunity_scores" ? ++seq : uuid()), created_at: now, updated_at: now };
+      if (t === "fin_calculations") Object.assign(base, { is_current: true });
       if (t === "ai_analysis_runs") Object.assign(base, { status: "en_curs", attempts: 1, started_at: now, stats: {}, errors: [] });
       if (t === "ai_opportunities") Object.assign(base, { status: "nova", detected_at: now, last_seen_at: now, evidence: [], score_factors: [] });
       if (t === "crm_tasks") Object.assign(base, { status: "pendent" });
@@ -132,6 +166,9 @@ export function fakeSupabase(seed: Record<string, Row[]> = {}, rpcs: Record<stri
       if (t === "cap_invoice_readings") Object.assign(base, { status: "pendent", attempts: 0, fields: [], warnings: [], missing: [] });
       if (t === "cap_lead_documents") Object.assign(base, { status: "rebut" });
       if (t === "cap_referral_links") Object.assign(base, { active: true, channel: "recomanacio" });
+      if (t === "lead_mailboxes") Object.assign(base, { last_uid: 0, uidvalidity: null, total_seen: 0, leads_created: 0, leads_updated: 0, discarded: 0, lock_owner: null, lock_until: null });
+      if (t === "lead_mail_messages") Object.assign(base, { status: "pendent", attempts: 0, next_attempt_at: now, attachments: [], fields: {}, category_reasons: [], match_refs: [], opportunity_ids: [], suspicious: false, erased_at: null, retain_until: new Date(Date.now() + 730 * 86_400_000).toISOString() });
+      if (t === "lead_mail_imports") Object.assign(base, { status: "previsualitzat", processed: 0 });
       return { ...base, ...r };
     };
 

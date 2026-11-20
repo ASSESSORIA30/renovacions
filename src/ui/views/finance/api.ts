@@ -35,6 +35,8 @@ export interface ContractEcon {
   owner: { id: string; name: string | null } | null; collaborator: { id: string; name: string | null } | null;
   facts: { segment: string | null; service: string | null; refDate: string; annualKwh: number | null; months: number } | null;
   calculations: Calc[]; ledger: Ledger[];
+  /** 059: càlcul automàtic fallit en desar el contracte (pendent de reintent). */
+  calcPending?: { status: string; last_error: string | null; attempts: number; source: string | null; updated_at: string } | null;
   summary: { provider: { estimated: string | null; estimatedStatus: string | null; accrued: string; invoiced: string; confirmed: string; collected: string; adjustments: string }; margin: { status: string; value: string | null; estimated: string | null; note: string }; costs: string } | null;
   payouts: { comercial: Payout | null; collaborador: Payout | null };
   statementLines: { id: string; amount: string; kind: string; match_status: string; expected_amount: string | null; difference: string | null; concept: string | null; fin_provider_statements: { retailer: string; reference: string; received_at: string } | null }[];

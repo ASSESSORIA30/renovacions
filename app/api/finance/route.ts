@@ -1,10 +1,13 @@
 import { z } from "zod";
 import {
   accrueContract, addCost, collaboratorSplit, autoMatch, buildSettlement, calculateContract, cancelContract, collaborators, computeIncentives, contractEconomics, createStatement, dashboard, deleteDraft,
-  getSettlement, getStatement, listRules, listSettlements, listStatements, manualEntry, myCommissions, profitability, ranking, registerPayment, registerReceipt, resolveLine,
+  getSettlement, getStatement, listRules, listSettlements, listStatements, manualEntry, myCommissions, profitability, ranking, registerPayment, registerReceipt, resolveLine, settlementLineAction,
   saveCollaboratorTerms, saveEconomics, saveRule, proposeRules, setRuleStatus, setTarget, settlementPdf, settlementStatus, simulate, previewStatement, missingContracts, createMissingContracts, createContractForLine, conciliateAll,
 } from "@/server/finance";
 import { auditOverview } from "@/server/commission-audit";
+import { regularizationRuns, regularizeCommissions } from "@/server/commission-regularize";
+import { listServiceRules, saveServiceRule, setServiceRuleStatus } from "@/server/multiservice";
+import { annulSelfInvoice, listSelfInvoices, previewSelfInvoice, proposeForSelfInvoice, registerCollection, selfInvoiceFileUrl, setStatementBillingMode, statementBilling, statementStates } from "@/server/self-billing";
 import { finStaff } from "@/server/permissions";
 import { handler, HttpError, requireUser } from "@/server/supabase";
 
@@ -47,14 +50,21 @@ const get = handler(async (req) => {
     case "statements": return listStatements(u);
     case "statement": return getStatement(u, p.id ?? "");
     case "collab_split": return collaboratorSplit(u, p.id ?? "");
+    // migració 033 · autofactures i cobraments
+    case "statement_billing": return statementBilling(u, p.id ?? "");
+    case "statement_states": return statementStates(u);
+    case "self_invoices": return listSelfInvoices(u, p);
+    case "self_invoice_file": return selfInvoiceFileUrl(u, p.id ?? "");
     case "mine": return myCommissions(u);
     case "audit": return auditOverview(u, p);
+    case "service_rules": return listServiceRules(u);
+    case "regularization": return regularizationRuns(u, p.id || undefined);
     default: throw new HttpError(400, "Petició no vàlida");
   }
 });
 
 const body = z.object({
-  action: z.enum(["calculate", "accrue", "economics", "cancel", "manual", "cost", "rule_save", "rules_propose", "rule_status", "simulate", "incentives", "settlement_build", "settlement_status", "settlement_delete", "payment", "collab_terms", "statement_create", "statement_preview", "statement_match", "missing_contracts", "create_missing_contracts", "line_contract", "conciliate_all", "line_resolve", "receipt", "target"]),
+  action: z.enum(["calculate", "accrue", "economics", "cancel", "manual", "cost", "rule_save", "rules_propose", "rule_status", "simulate", "incentives", "settlement_build", "settlement_status", "settlement_delete", "settlement_line", "payment", "collab_terms", "statement_create", "statement_preview", "statement_match", "missing_contracts", "create_missing_contracts", "line_contract", "conciliate_all", "line_resolve", "receipt", "target", "self_invoice_preview", "self_invoice_propose", "collection_register", "self_invoice_annul", "statement_billing_mode", "service_rule_save", "service_rule_status", "regularize"]),
   id: z.string().uuid().optional(),
   data: z.unknown().optional(),
   status: z.string().max(30).optional(),
@@ -68,6 +78,7 @@ export const POST = handler(async (req) => {
   const b = p.data;
   const id = () => { if (!b.id) throw new HttpError(400, "Falta l'identificador"); return b.id; };
   switch (b.action) {
+    case "settlement_line": return settlementLineAction(u, id(), b.data);
     case "calculate": return calculateContract(u, id());
     case "accrue": return accrueContract(u, id());
     case "economics": return saveEconomics(u, id(), b.data);
@@ -75,6 +86,8 @@ export const POST = handler(async (req) => {
     case "manual": return manualEntry(u, b.data);
     case "cost": return addCost(u, b.data);
     case "rule_save": return saveRule(u, b.data, b.id);
+    case "service_rule_save": return saveServiceRule(u, b.data, b.id);
+    case "service_rule_status": return setServiceRuleStatus(u, id(), (["aprovada", "arxivada"].includes(b.status ?? "") ? b.status : "esborrany") as "aprovada");
     case "rules_propose": return proposeRules(u, b.data);
     case "rule_status": return setRuleStatus(u, id(), (["aprovada", "retirada", "pendent_aprovacio", "esborrany"].includes(b.status ?? "") ? b.status : "esborrany") as "aprovada");
     case "simulate": return simulate(u, b.data);
@@ -94,5 +107,11 @@ export const POST = handler(async (req) => {
     case "line_resolve": return resolveLine(u, b.data);
     case "receipt": return registerReceipt(u, id(), b.data);
     case "target": return setTarget(u, b.data);
+    case "self_invoice_preview": return previewSelfInvoice(u, b.data, b.file);
+    case "self_invoice_propose": return proposeForSelfInvoice(u, b.data);
+    case "collection_register": return registerCollection(u, b.data, b.file);
+    case "self_invoice_annul": return annulSelfInvoice(u, id(), b.data);
+    case "statement_billing_mode": return setStatementBillingMode(u, id(), b.data);
+    case "regularize": return regularizeCommissions(u, b.data);
   }
 });

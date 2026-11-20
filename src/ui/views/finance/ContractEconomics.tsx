@@ -6,6 +6,8 @@ import { CALC_STATUS_LABEL, LAYER_LABEL, LEDGER_KIND_LABEL, SEGMENTS, SEGMENT_LA
 import { useApp } from "@/data/store";
 import { Badge, Button, Modal, Notice, cn } from "../../components/ui";
 import { eur, fApi, fmtD, type Calc, type ContractEcon } from "./api";
+import { IberdrolaContractPanel } from "./IberdrolaCommissions";
+import { HistoricForContract } from "./HistoricSettlements";
 
 const toast = (title: string, body?: string, tone: "ok" | "err" = "ok") => useApp.getState().toast({ title, body, tone });
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -44,6 +46,7 @@ export function ContractEconomicsDialog({ contractId, onClose }: { contractId: s
             </>}
           </div>
 
+          {d.calcPending && <Notice tone="amber">Comissió pendent de càlcul: el càlcul automàtic va fallar en desar el contracte ({d.calcPending.attempts} intent{d.calcPending.attempts === 1 ? "" : "s"}). {d.calcPending.last_error ?? ""} Prem «Calcula» per reintentar-ho.</Notice>}
           {d.summary && (
             <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
               <Tile label="Estimat (proveïdor)" value={d.summary.provider.estimated} sub={d.summary.provider.estimatedStatus ? CALC_STATUS_LABEL[d.summary.provider.estimatedStatus as CalcStatus] : "Sense càlcul"} tone="text-muted" />
@@ -76,6 +79,7 @@ export function ContractEconomicsDialog({ contractId, onClose }: { contractId: s
               );
             })}
           </div>
+          {staff && /iberdrola/i.test(d.contract.retailer) && <IberdrolaContractPanel contractId={contractId} onChanged={() => void load()} />}
 
           <section>
             <h4 className="mb-1.5 text-[12.5px] font-semibold">Moviments ({d.ledger.length})</h4>
@@ -97,6 +101,7 @@ export function ContractEconomicsDialog({ contractId, onClose }: { contractId: s
           </section>
 
           {staff && d.commissionHistory && <CommissionHistory h={d.commissionHistory} deferred={d.economics?.settlement_deferred_until ?? null} />}
+          {staff && <HistoricForContract contractId={contractId} />}
           {staff && !d.commissionHistory && d.statementLines.length > 0 && (
             <section>
               <h4 className="mb-1.5 text-[12.5px] font-semibold">Liquidacions del proveïdor</h4>

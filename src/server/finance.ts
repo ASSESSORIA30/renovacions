@@ -9,12 +9,14 @@ import "server-only";
  */
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { REMUNERATION_KIND, REMUNERATION_MODELS } from "@/comparator/pricing-model";
 import * as XLSX from "xlsx";
 import {
-  D, CALC_STATUS_LABEL, LEDGER_KIND_LABEL, computeCommission, contributionMargin, deriveSegment, incentiveDelta, lastMonths, lineFingerprint, money, monthOf,
-  periodRange, pickRule, planFinanceAlerts, reconcile, retrocession, ruleApplies, tierAmount, type Facts, type FinAlertInput, type Layer, type ParsedLine, type RuleRow,
+  D, CALC_STATUS_LABEL, LEDGER_KIND_LABEL, computeCommission, contributionMargin, deriveSegment, incentiveDelta, lastMonths, lineFingerprint, money, monthOf, parseMatrix,
+  periodRange, pickRule, planFinanceAlerts, reconcile, retailerMatches, retrocession, ruleApplies, tierAmount, UNIT_OF, type Facts, type FinAlertInput, type Kind, type Layer, type ParsedLine, type RuleRow,
 } from "@/core/commissions";
 import { buildSettlementPdf } from "@/core/settlement-pdf";
+import { pendingCommission, type CommissionControl } from "@/core/commission-controls";
 import { cupsBase, gridFromBytes, movementFingerprint, normCups, readSettlement, type ReadResult } from "@/core/settlement-reader";
 import { matchesRetailer, norm as normName } from "@/core/retailers";
 import { SERVICES, type Service } from "@/core/sales";
@@ -25,6 +27,8 @@ import type { Snapshot } from "@/comparator/snapshot";
 import { isStaffRole, parse, publishToRenewals, type U } from "./crm";
 import { finStaff, hasPerm } from "./permissions";
 import { notify } from "./sales";
+import { iberdrolaFacts } from "./iberdrola-commissions";
+import { historicLinkedLedger } from "./historic-settlements";
 
 type PgError = { code?: string; message?: string } | null;
 type SB = U["sb"] | ReturnType<typeof adminClient>;
@@ -34,6 +38,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 export function finError(e: PgError, fallback = "No s'ha pogut desar"): never {
   const m = e?.message ?? "";
+  if (/fin_commission_controls|fin_settlement_line_action/.test(m)) throw new HttpError(409, "Falta aplicar la migració 20261112190054_collaborator_line_actions.sql a Supabase");
   if (e?.code === "42703" || e?.code === "PGRST204" || /column .* does not exist|Could not find the '.*' column|fin_register_receipt_net|fin_receipt_allocations/i.test(m)) throw new HttpError(409, "Falta aplicar la migració supabase/migrations/025_auditor_comissions.sql a Supabase");
   if (e?.code === "42P01" || e?.code === "PGRST205" || /does not exist|schema cache/i.test(m)) throw new HttpError(409, "Falta aplicar la migració supabase/migrations/011_crm_economia.sql a Supabase");
   if (e?.code === "23514" && !/violates check constraint/i.test(m)) throw new HttpError(400, m);
@@ -74,30 +79,42 @@ export interface CommercialEcon {
   linked_at: string; linked_by: string | null; comparison_id: string | null;
 }
 interface Ctx {
-  contract: { id: string; client_id: string; supply_id: string | null; retailer: string; product: string | null; status: string; start_date: string | null; end_date: string | null; signed_at: string | null; owner_id: string | null; expedient_id: string | null; previous_contract_id?: string | null };
+  contract: { id: string; client_id: string; supply_id: string | null; retailer: string; product: string | null; status: string; start_date: string | null; end_date: string | null; signed_at: string | null; owner_id: string | null; expedient_id: string | null; previous_contract_id?: string | null; collaborator_id?: string | null };
   client: { id: string; name: string; kind: string; owner_id: string | null; collaborator_id: string | null; origin: string | null };
   supply: { cups: string; energy_type: string; annual_kwh: number | null; power_kw: (number | null)[] | null; access_tariff?: string | null } | null;
   exp: { id: string; code: string; service: Service; customer_type: string; owner_id: string | null; collaborator_id: string | null; activated_at: string | null } | null;
   econ: { segment: string | null; product_modality: string | null; eligible_mwh: string | null; energy_increment_eur_kwh: string | null; power_increment_eur_kw_day: string | null; economic_months: number; econ_status: string; cancelled_at: string | null; cancel_reason: string | null; notes: string | null; commercial?: CommercialEcon | null } | null;
   owner: string | null; collaborator: string | null; service: Service | null; refDate: string;
 }
+/**
+ * Servei econòmic del contracte. El tipus d'energia del subministrament (CUPS) mana: un CUPS de gas sempre és «gas»
+ * i un CUPS d'electricitat mai no és «gas», encara que l'expedient digui el contrari (abans un gas podia quedar com a
+ * «llum_residencial» i no hi entrava cap regla de gas). Si l'expedient és compatible, se'n respecta el segment.
+ */
+export function serviceFor(expService: Service | null, energyType: string | null, clientKind: string | null): Service | null {
+  if (!energyType) return expService;
+  if (energyType === "gas") return "gas";
+  if (expService === "llum_residencial" || expService === "llum_empresa") return expService;
+  return clientKind === "particular" ? "llum_residencial" : "llum_empresa";
+}
 async function context(sb: SB, contractId: string): Promise<Ctx> {
   if (!uuid.safeParse(contractId).success) throw new HttpError(404, "Contracte no trobat");
-  const k = (await sb.from("crm_contracts").select("id,client_id,supply_id,retailer,product,status,start_date,end_date,signed_at,owner_id,expedient_id,previous_contract_id").eq("id", contractId).maybeSingle()).data as Ctx["contract"] | null;
+  const k = (await sb.from("crm_contracts").select("id,client_id,supply_id,retailer,product,status,start_date,end_date,signed_at,owner_id,expedient_id,previous_contract_id,collaborator_id").eq("id", contractId).maybeSingle()).data as Ctx["contract"] | null;
   if (!k) throw new HttpError(404, "Contracte no trobat o sense permís");
   const [c, s, e, econ] = await Promise.all([
     sb.from("crm_clients").select("id,name,kind,owner_id,collaborator_id,origin").eq("id", k.client_id).single(),
     k.supply_id ? sb.from("crm_supplies").select("cups,energy_type,annual_kwh,power_kw,access_tariff").eq("id", k.supply_id).maybeSingle() : Promise.resolve({ data: null }),
-    sb.from("crm_expedients").select("id,code,service,customer_type,owner_id,collaborator_id,activated_at").or(`contract_id.eq.${k.id}${k.expedient_id ? `,id.eq.${k.expedient_id}` : ""}`).limit(1),
+    sb.from("crm_expedients").select("id,code,service,customer_type,owner_id,collaborator_id,activated_at").eq(k.expedient_id ? "id" : "contract_id", k.expedient_id ?? k.id).limit(1),
     sb.from("fin_contract_economics").select("*").eq("contract_id", k.id).maybeSingle(),
   ]);
   const client = c.data as Ctx["client"];
   const supply = s.data as Ctx["supply"];
   const exp = (e.data?.[0] ?? null) as Ctx["exp"];
-  const service: Service | null = exp?.service ?? (supply ? (supply.energy_type === "gas" ? "gas" : client.kind === "particular" ? "llum_residencial" : "llum_empresa") : null);
+  const service = serviceFor(exp?.service ?? null, supply?.energy_type ?? null, client.kind);
   return {
     contract: k, client, supply, exp, econ: (econ.data ?? null) as Ctx["econ"],
-    owner: k.owner_id ?? exp?.owner_id ?? client.owner_id, collaborator: exp?.collaborator_id ?? client.collaborator_id,
+    // atribució del col·laborador: contracte → expedient → client (mai s'assigna un col·laborador arbitrari)
+    owner: k.owner_id ?? exp?.owner_id ?? client.owner_id, collaborator: k.collaborator_id ?? exp?.collaborator_id ?? client.collaborator_id,
     service, refDate: exp?.activated_at ?? k.start_date ?? k.signed_at ?? today(),
   };
 }
@@ -132,45 +149,70 @@ const loadRules = async (sb: SB) => {
 
 /* ======================================================================= càlcul i meritació */
 
-export async function calculateContract(u: U, contractId: string) {
+export async function calculateContract(u: U, contractId: string, collaboratorId?: string) {
   await staffOnly(u, "edit");
-  const ctx = await context(u.sb, contractId);
-  const rules = await loadRules(u.sb);
-  const ledger = await ledgerFor(u.sb, contractId);
+  const r = await runCalculation(u.sb, u.user.id, contractId, { collaboratorId });
+  // reintent correcte d'un càlcul automàtic que havia fallat (059): deixa de constar com a pendent
+  if (!collaboratorId) { try { await adminClient().from("fin_calc_pending").update({ status: "resolt", updated_at: new Date().toISOString() }).eq("contract_id", contractId).eq("status", "error"); } catch { /* 059 no aplicada */ } }
+  return { results: r.results.map(({ layer, beneficiary, status, amount }) => ({ layer, beneficiary, status, amount })) };
+}
+
+export interface CalcLayerResult { layer: Layer; beneficiary: string | null; status: string; amount: string | null; formula: string; rule: string | null }
+/**
+ * Motor de càlcul del contracte (únic per a totes les vies: botó «Calcula», alta/edició/renovació automàtica i
+ * regularització). Calcula PRIMER el proveïdor i després el comercial i el col·laborador (que poden dependre'n).
+ * Només escriu instantànies a `fin_calculations` (idempotents per `calc_hash`): mai moviments, liquidacions ni pagaments.
+ * Amb `dryRun` no escriu res. El client `sb` el tria qui crida (sessió de l'usuari o servidor) i els permisos també.
+ */
+export async function runCalculation(sb: SB, actorId: string, contractId: string, opts: { collaboratorId?: string; dryRun?: boolean } = {}) {
+  const { collaboratorId, dryRun = false } = opts;
+  const ctx = await context(sb, contractId);
+  if (collaboratorId && ctx.collaborator !== collaboratorId) throw new HttpError(409, "El col·laborador del contracte ha canviat. Actualitza la llista.");
+  const rules = await loadRules(sb);
+  const ledger = await ledgerFor(sb, contractId);
   const confirmed = sum(ledger.filter((l) => l.layer === "proveidor" && l.kind === "confirmacio").map((l) => l.amount));
-  const out: { layer: Layer; beneficiary: string | null; status: string; amount: string | null }[] = [];
+  const out: CalcLayerResult[] = [];
   let providerEstimate: string | null = null;
+  // Iberdrola 2026 (053): només si hi ha una regla «taula_iberdrola» per a aquesta comercialitzadora es carreguen les seves dades
+  const iberdrola = rules.some((r) => r.kind === "taula_iberdrola" && retailerMatches(r, ctx.contract.retailer)) ? await iberdrolaFacts(sb, ctx) : undefined;
   const layers: { layer: Layer; who: string | null }[] = [{ layer: "proveidor", who: null }, { layer: "comercial", who: ctx.owner }, { layer: "collaborador", who: ctx.collaborator }];
   for (const { layer, who } of layers) {
+    if (collaboratorId && layer !== "collaborador") continue;
     if (layer !== "proveidor" && !who) continue;
-    const f = facts(ctx, D(confirmed).gt(0) ? confirmed : providerEstimate, D(confirmed).gt(0) ? "confirmat" : providerEstimate ? "estimat" : null);
-    const { rule, simulation, conflict } = pickRule(rules, f, layer, who);
+    const f: Facts = { ...facts(ctx, D(confirmed).gt(0) ? confirmed : providerEstimate, D(confirmed).gt(0) ? "confirmat" : providerEstimate ? "estimat" : null), ...(iberdrola !== undefined ? { iberdrola } : {}) };
+    const { rule, simulation, conflict } = pickRule(rules, f, layer, who, { initialCollaboratorRateAsOf: today() });
     const res = conflict.length ? { status: "pendent_configuracio" as const, amount: null, formula: `Conflicte: hi ha ${conflict.length} regles igual d'específiques (${conflict.map((r) => r.name).join(", ")}). Cal concretar-les.`, breakdown: [] }
       : rule ? computeCommission(rule, f, simulation) : { status: "sense_regla" as const, amount: null, formula: "No hi ha cap regla aplicable per a aquesta capa", breakdown: [] };
     if (layer === "proveidor" && res.amount && res.status === "calculat") providerEstimate = res.amount;
-    const inputs = { ...f, owner: ctx.owner, collaborator: ctx.collaborator };
+    out.push({ layer, beneficiary: who, status: res.status, amount: res.amount, formula: res.formula ?? "", rule: rule?.name ?? null });
+    if (dryRun) continue;
+    const { iberdrola: _ib, ...plain } = f; void _ib;   // les taules no es desen: només la instantània de la regla aplicada
+    const inputs = { ...plain, owner: ctx.owner, collaborator: ctx.collaborator, ...("snapshot" in res && res.snapshot ? { iberdrola_snapshot: res.snapshot } : {}) };
     const calc_hash = sha({ rule: rule?.id ?? null, inputs, status: res.status, amount: res.amount });
-    const base = u.sb.from("fin_calculations");
-    const existing = await base.select("id,is_current").eq("contract_id", contractId).eq("layer", layer).eq("calc_hash", calc_hash).limit(5);
-    const match = (existing.data ?? []).find(() => true);
+    const find = async () => ((await sb.from("fin_calculations").select("id,is_current").eq("contract_id", contractId).eq("layer", layer).eq("calc_hash", calc_hash).limit(5)).data ?? [])[0] as { id: string; is_current: boolean } | undefined;
+    const match = await find();
     let id: string;
     if (match) {
       id = match.id;
-      if (!match.is_current) await u.sb.from("fin_calculations").update({ is_current: true }).eq("id", id);
+      if (!match.is_current) await sb.from("fin_calculations").update({ is_current: true }).eq("id", id);
     } else {
-      const ins = await u.sb.from("fin_calculations").insert({ contract_id: contractId, layer, beneficiary_id: who, rule_id: rule?.id ?? null, rule_key: rule?.rule_key ?? null, rule_version: rule?.version ?? null, status: res.status, amount: res.amount, inputs, breakdown: res.breakdown, formula: res.formula, calc_hash, created_by: u.user.id }).select("id").single();
-      if (ins.error) finError(ins.error, "No s'ha pogut desar el càlcul");
-      id = ins.data.id;
+      const ins = await sb.from("fin_calculations").insert({ contract_id: contractId, layer, beneficiary_id: who, rule_id: rule?.id ?? null, rule_key: rule?.rule_key ?? null, rule_version: rule?.version ?? null, status: res.status, amount: res.amount, inputs, breakdown: res.breakdown, formula: res.formula, calc_hash, created_by: actorId }).select("id").single();
+      if (ins.error) {
+        // dues desades simultànies del mateix contracte: la segona reutilitza la instantània de la primera (sense duplicats)
+        const again = ins.error.code === "23505" ? await find() : undefined;
+        if (!again) finError(ins.error, "No s'ha pogut desar el càlcul");
+        id = again.id;
+      } else id = ins.data.id;
     }
-    await u.sb.from("fin_calculations").update({ is_current: false }).eq("contract_id", contractId).eq("layer", layer).eq("is_current", true).neq("id", id);
-    out.push({ layer, beneficiary: who, status: res.status, amount: res.amount });
+    await sb.from("fin_calculations").update({ is_current: false }).eq("contract_id", contractId).eq("layer", layer).eq("is_current", true).neq("id", id);
   }
-  return { results: out };
+  return { results: out, service: ctx.service, collaborator: ctx.collaborator, owner: ctx.owner };
 }
 
-export async function accrueContract(u: U, contractId: string) {
+export async function accrueContract(u: U, contractId: string, collaboratorId?: string) {
   await staffOnly(u, "edit");
   const ctx = await context(u.sb, contractId);
+  if (collaboratorId && ctx.collaborator !== collaboratorId) throw new HttpError(409, "El col·laborador del contracte ha canviat. Actualitza la llista.");
   if (ctx.econ && ctx.econ.econ_status !== "actiu") throw new HttpError(400, "El contracte està anul·lat o penalitzat: no es merita.");
   const calcs = ((await u.sb.from("fin_calculations").select("*").eq("contract_id", contractId).eq("is_current", true)).data ?? []) as { id: string; layer: Layer; beneficiary_id: string | null; rule_id: string | null; status: string; amount: string | null; formula: string | null }[];
   if (!calcs.length) throw new HttpError(400, "Calcula primer les comissions del contracte.");
@@ -181,6 +223,7 @@ export async function accrueContract(u: U, contractId: string) {
   const collected = ledger.some((l) => l.layer === "proveidor" && l.kind === "cobrament");
   const created: string[] = [], skipped: { layer: string; reason: string }[] = [];
   for (const c of calcs) {
+    if (collaboratorId && (c.layer !== "collaborador" || c.beneficiary_id !== collaboratorId)) continue;
     if (c.status !== "calculat" || c.amount == null) { skipped.push({ layer: c.layer, reason: CALC_STATUS_LABEL[c.status as keyof typeof CALC_STATUS_LABEL] ?? c.status }); continue; }
     const ev = rules.find((r) => r.id === c.rule_id)?.conditions?.accrual_event ?? "activacio";
     if (ev === "activacio" && !active) { skipped.push({ layer: c.layer, reason: "El contracte encara no està activat" }); continue; }
@@ -332,11 +375,15 @@ export async function contractEconomics(u: U, contractId: string) {
     staff ? u.sb.from("crm_contract_finance").select("*").eq("contract_id", contractId).maybeSingle() : Promise.resolve({ data: null }),
     ctx.exp && staff ? u.sb.from("crm_commission_records").select("*").eq("expedient_id", ctx.exp.id).maybeSingle() : Promise.resolve({ data: null }),
   ]);
+  // 059: si el càlcul automàtic en desar el contracte va fallar, es mostra (no s'amaga) fins que es reintenti
+  const calcPending = staff ? ((await u.sb.from("fin_calc_pending").select("status,last_error,attempts,source,updated_at").eq("contract_id", contractId).eq("status", "error").maybeSingle()).data ?? null) : null;
   if (calcs.error) finError(calcs.error);
+  const controls = (await commissionControls(u.sb)).rows;
+  const reportedLedger = ledger.filter((l) => !controls.some((c) => c.ledger_id === l.id && c.status === "cancelled"));
   const allCalcs = (calcs.data ?? []) as { id: string; layer: Layer; beneficiary_id: string | null; rule_id: string | null; rule_key: string | null; rule_version: number | null; status: string; amount: string | null; breakdown: unknown; formula: string | null; is_current: boolean; created_at: string; inputs: unknown }[];
   const isCollab = u.profile.role === "colaborador";
   const visibleCalcs = allCalcs.map((c) => (isCollab ? { ...c, breakdown: [], inputs: null, formula: c.status === "calculat" ? "Import segons les condicions pactades" : c.formula } : c));
-  const L = (layer: Layer, kinds: string[]) => sum(ledger.filter((l) => l.layer === layer && kinds.includes(l.kind)).map((l) => l.amount));
+  const L = (layer: Layer, kinds: string[]) => sum(reportedLedger.filter((l) => l.layer === layer && kinds.includes(l.kind)).map((l) => l.amount));
   const cur = (layer: Layer) => allCalcs.find((c) => c.layer === layer && c.is_current);
   const provEst = cur("proveidor");
   const payoutsAccrued = money(D(L("comercial", ["meritacio", "regularitzacio", "bonificacio", "ajustament", "anullacio", "retrocessio"])).plus(L("collaborador", ["meritacio", "regularitzacio", "bonificacio", "ajustament", "anullacio", "retrocessio"])));
@@ -354,7 +401,7 @@ export async function contractEconomics(u: U, contractId: string) {
   const setIds = [...new Set(ledger.map((l) => l.settlement_id).filter(Boolean))] as string[];
   const settlements = setIds.length ? (((await u.sb.from("fin_settlements").select("id,code,status").in("id", setIds)).data ?? []) as { id: string; code: string; status: string }[]) : [];
   const payout = (layer: "comercial" | "collaborador") => {
-    const rows = ledger.filter((l) => l.layer === layer);
+    const rows = reportedLedger.filter((l) => l.layer === layer);
     if (!rows.length && !cur(layer)) return null;
     const benef = cur(layer)?.beneficiary_id ?? rows[0]?.beneficiary_id ?? null;
     return {
@@ -362,8 +409,8 @@ export async function contractEconomics(u: U, contractId: string) {
       estimated: cur(layer)?.amount ?? null, status: cur(layer)?.status ?? null,
       accrued: sum(rows.filter((l) => ["meritacio", "regularitzacio", "bonificacio"].includes(l.kind)).map((l) => l.amount)),
       adjustments: sum(rows.filter((l) => ["ajustament", "anullacio", "retrocessio"].includes(l.kind)).map((l) => l.amount)),
-      settled: sum(rows.filter((l) => l.settlement_id && settlements.find((s) => s.id === l.settlement_id && ["aprovada", "pagada"].includes(s.status))).map((l) => l.amount)),
-      pending: sum(rows.filter((l) => !l.settlement_id || !settlements.find((s) => s.id === l.settlement_id && ["aprovada", "pagada"].includes(s.status))).map((l) => l.amount)),
+      settled: sum(rows.filter((l) => controls.some((c) => c.ledger_id === l.id && c.status === "paid") || (l.settlement_id && settlements.find((s) => s.id === l.settlement_id && ["aprovada", "pagada"].includes(s.status)))).map((l) => l.amount)),
+      pending: sum(rows.filter((l) => pendingCommission(l.id, controls) && (!l.settlement_id || !settlements.find((s) => s.id === l.settlement_id && ["aprovada", "pagada"].includes(s.status)))).map((l) => l.amount)),
     };
   };
   // Fase 14: historial de comissions del contracte amb els quatre estats separats (prevista, liquidada, cobrada, reclamada)
@@ -407,6 +454,7 @@ export async function contractEconomics(u: U, contractId: string) {
     ledger: ledger.map((l) => ({ ...l, settlement: settlements.find((s) => s.id === l.settlement_id) ?? null })),
     summary, payouts: { comercial: payout("comercial"), collaborador: payout("collaborador") },
     statementLines: lines.data ?? [], costs: costs.data ?? [], legacy: staff ? { finance: legacy.data, record: rec.data } : null,
+    calcPending,
     permissions: { staff, canManageRules: await canManageRules(u) },
   };
 }
@@ -442,7 +490,7 @@ const ruleInput = z.object({
   service: z.enum(SERVICES).nullable().optional(),
   segment: z.enum(["residencial", "pime", "gran_consum"]).nullable().optional(),
   beneficiary_id: uuid.nullable().optional(),
-  kind: z.enum(["fix_contracte", "per_mwh", "energia_potencia", "pct_marge", "pct_increment_preu", "pct_comissio_rebuda", "trams_volum", "bonificacio", "regularitzacio", "retrocessio"]),
+  kind: z.enum(["fix_contracte", "matriu_fixa", "per_mwh", "per_kw", "energia_potencia", "pct_marge", "pct_increment_preu", "pct_comissio_rebuda", "pct_energia", "pct_potencia", "trams_volum", "bonificacio", "regularitzacio", "retrocessio"]),
   value: z.string().regex(/^\d+(\.\d{1,6})?$/, "Valor no vàlid").nullable().optional(),
   tiers: z.array(z.object({ threshold: z.number().positive(), amount: z.number().min(0) })).max(20).nullable().optional(),
   conditions: z.record(z.unknown()).default({}),
@@ -451,6 +499,9 @@ const ruleInput = z.object({
   valid_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   valid_to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   notes: z.string().trim().max(1000).nullable().optional(),
+  // Fase 15 (migració 038): model de remuneració del FEE comercial i tarifa concreta (capa proveïdor)
+  remuneration_model: z.enum(REMUNERATION_MODELS).nullable().optional(),
+  tariff_product_id: uuid.nullable().optional(),
 });
 export async function listRules(u: U) {
   const r = await u.sb.from("fin_rules").select("*").order("layer").order("rule_key").order("version", { ascending: false });
@@ -462,7 +513,17 @@ export async function listRules(u: U) {
 export async function saveRule(u: U, raw: unknown, id?: string) {
   if (!(await canManageRules(u))) throw new HttpError(403, "Només Direcció o la cap d'Administració gestionen les regles");
   const b = parse(ruleInput, raw);
-  const row = { ...b, retailer: b.retailer || null, product: b.product || null, unit: { per_mwh: "eur_mwh", energia_potencia: "eur_mwh", pct_marge: "pct", pct_increment_preu: "pct", pct_comissio_rebuda: "pct", retrocessio: "pct" }[b.kind as string] ?? "eur", tiers: b.kind === "trams_volum" ? b.tiers ?? [] : null, value: b.kind === "trams_volum" ? null : b.value ?? null };
+  if (b.remuneration_model && b.layer !== "proveidor") throw new HttpError(400, "El model de remuneració del FEE només s'aplica a la capa «Proveïdor → Assessoria 3.0»");
+  if (b.remuneration_model && REMUNERATION_KIND[b.remuneration_model].kind !== b.kind) throw new HttpError(400, `El model «${b.remuneration_model}» es desa com a tipus «${REMUNERATION_KIND[b.remuneration_model].kind}»`);
+  // sense la migració 038 (o sense model) no s'envien les columnes noves: el CRM funciona com abans
+  const { remuneration_model, tariff_product_id, ...rest } = b;
+  // matriu d'imports fixos: l'import surt de la casella (tarifa × consum × potència P6); «value» no s'hi fa servir
+  if (b.kind === "matriu_fixa") {
+    const m = parseMatrix(b.conditions);
+    if (!m.matrix) throw new HttpError(400, `La matriu no és vàlida: ${m.error}`);
+    b.value = "0";
+  }
+  const row = { ...rest, ...(remuneration_model ? { remuneration_model } : {}), ...(tariff_product_id ? { tariff_product_id } : {}), retailer: b.retailer || null, product: b.product || null, unit: UNIT_OF[b.kind as Kind] ?? "eur", tiers: b.kind === "trams_volum" ? b.tiers ?? [] : null, value: b.kind === "trams_volum" ? null : b.value ?? null, conditions: b.conditions };
   if (id) {
     const cur = (await u.sb.from("fin_rules").select("*").eq("id", id).maybeSingle()).data;
     if (!cur) throw new HttpError(404, "Regla no trobada");
@@ -589,6 +650,36 @@ export async function computeIncentives(u: U, month: string, onlyUser?: string) 
 
 /* ======================================================================= liquidacions */
 
+async function commissionControls(sb: SB) {
+  const rows: CommissionControl[] = [];
+  for (let from = 0; ; from += 1000) {
+    const r = await sb.from("fin_commission_controls").select("*").order("ledger_id").range(from, from + 999);
+    if (r.error) {
+      if (["42P01", "PGRST205"].includes(r.error.code)) return { available: false, rows: [] as CommissionControl[] };
+      finError(r.error);
+    }
+    const page = (r.data ?? []) as CommissionControl[];
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  // Migració 054: les comissions que ja consten liquidades al CRM antic (liquidació històrica) mai no es mostren com a
+  // pendents de pagar. No s'escriu res: només s'afegeixen a la consulta com a «ja pagades».
+  const known = new Set(rows.map((x) => x.ledger_id));
+  for (const id of await historicLinkedLedger(sb)) if (!known.has(id)) rows.push({ ledger_id: id, source_settlement_id: null, status: "paid", deferred_until: null, paid_at: null, reference: "CRM antic", reason: "Liquidació històrica del CRM antic" });
+  return { available: true, rows };
+}
+
+export async function settlementLineAction(u: U, id: string, raw: unknown) {
+  await staffOnly(u, "edit");
+  const b = parse(z.object({ ledger: uuid, action: z.enum(["deferred", "cancelled", "paid", "restore"]),
+    until: z.string().date().nullable().optional(), paid_at: z.string().date().nullable().optional(),
+    reference: z.string().trim().max(120).nullable().optional(), reason: z.string().trim().min(1, "Indica el motiu").max(500) }), raw);
+  const r = await u.sb.rpc("fin_settlement_line_action", { p_settlement: id, p_ledger: b.ledger, p_action: b.action,
+    p_until: b.until ?? null, p_paid_at: b.paid_at ?? null, p_reference: b.reference ?? null, p_reason: b.reason });
+  if (r.error) finError(r.error, "No s'ha pogut modificar la comissió");
+  return { ok: true };
+}
+
 export async function listSettlements(u: U, raw: Record<string, string>) {
   let q = u.sb.from("fin_settlements").select("*").order("period_to", { ascending: false }).order("created_at", { ascending: false }).limit(300);
   if (raw.kind === "comercial" || raw.kind === "collaborador") q = q.eq("kind", raw.kind);
@@ -599,9 +690,10 @@ export async function listSettlements(u: U, raw: Record<string, string>) {
   const n = await names(u.sb);
   const staff = await finStaff(u);
   // moviments pendents de liquidar (per veure el saldo abans de preparar la liquidació)
-  const pend = ((await u.sb.from("fin_ledger").select("beneficiary_id,layer,amount").in("layer", ["comercial", "collaborador"]).is("settlement_id", null)).data ?? []) as { beneficiary_id: string; layer: string; amount: string }[];
+  const controls = (await commissionControls(u.sb)).rows;
+  const pend = ((await u.sb.from("fin_ledger").select("id,beneficiary_id,layer,amount").in("layer", ["comercial", "collaborador"]).is("settlement_id", null)).data ?? []) as { id: string; beneficiary_id: string; layer: string; amount: string }[];
   const pendingBy = new Map<string, string>();
-  for (const p of pend) pendingBy.set(`${p.layer}|${p.beneficiary_id}`, money(D(pendingBy.get(`${p.layer}|${p.beneficiary_id}`) ?? 0).plus(p.amount)));
+  for (const p of pend.filter((x) => pendingCommission(x.id, controls))) pendingBy.set(`${p.layer}|${p.beneficiary_id}`, money(D(pendingBy.get(`${p.layer}|${p.beneficiary_id}`) ?? 0).plus(p.amount)));
   return {
     rows: (r.data ?? []).map((s) => ({ ...s, beneficiary_name: n.get(s.beneficiary_id)?.name ?? null, pending: money(D(s.approved_amount ?? s.total_gross).minus(s.paid_amount)) })),
     unsettled: [...pendingBy.entries()].map(([k, v]) => { const [layer, id] = k.split("|"); return { layer, beneficiary_id: id, name: n.get(id)?.name ?? null, amount: v }; }),
@@ -615,6 +707,15 @@ export async function buildSettlement(u: U, raw: unknown) {
   const b = parse(z.object({ kind: z.enum(["comercial", "collaborador"]), beneficiary: uuid, month: z.string().regex(/^\d{4}-\d{2}$/), notes: z.string().max(500).nullable().optional() }), raw);
   const from = `${b.month}-01`, to = new Date(Date.UTC(Number(b.month.slice(0, 4)), Number(b.month.slice(5, 7)), 0)).toISOString().slice(0, 10);
   if (b.kind === "comercial") await computeIncentives(u, b.month, b.beneficiary);
+  if (b.kind === "collaborador" && to >= today()) {
+    // Preparar l'esborrany completa el pas que abans exigia calcular i meritar cada
+    // contracte a mà. Només comissions confirmades i elegibles; mai retrocessions.
+    const projection = await collaboratorProjection(u, [b.beneficiary]);
+    for (const row of projection.rows.filter((x) => x.ready)) {
+      await calculateContract(u, row.ctx.contract.id, b.beneficiary);
+      await accrueContract(u, row.ctx.contract.id, b.beneficiary);
+    }
+  }
   const r = await u.sb.rpc("fin_build_settlement", { p_kind: b.kind, p_beneficiary: b.beneficiary, p_from: from, p_to: to, p_notes: b.notes ?? null });
   if (r.error) finError(r.error, "No s'ha pogut preparar la liquidació");
   const id = r.data as string;
@@ -630,18 +731,27 @@ export async function getSettlement(u: U, id: string) {
   if (!uuid.safeParse(id).success) throw new HttpError(404, "Liquidació no trobada");
   const s = (await u.sb.from("fin_settlements").select("*").eq("id", id).maybeSingle()).data;
   if (!s) throw new HttpError(404, "Aquesta liquidació no existeix o no tens permís per veure-la");
-  const [lines, pays, n, audit] = await Promise.all([
-    u.sb.from("fin_settlement_lines").select("*, crm_contracts(retailer,product,crm_clients(name))").eq("settlement_id", id).order("category"),
+  const [lines, pays, n, audit, controls] = await Promise.all([
+    u.sb.from("fin_settlement_lines").select("*, crm_contracts(supply_id,retailer,product,crm_clients(name))").eq("settlement_id", id).order("category"),
     u.sb.from("fin_payments").select("*").eq("settlement_id", id).order("paid_at"),
     names(u.sb),
     (await finStaff(u)) ? u.sb.from("fin_audit").select("*").eq("entity_id", id).order("at") : Promise.resolve({ data: [] }),
+    commissionControls(u.sb),
   ]);
-  type LineRow = { id: string; contract_id: string | null; category: string; description: string; amount: string; crm_contracts: { retailer: string; product: string | null; crm_clients: { name: string } | null } | null };
+  if (lines.error) finError(lines.error);
+  type LineRow = { id: string; ledger_id: string; contract_id: string | null; category: string; description: string; amount: string; crm_contracts: { supply_id: string | null; retailer: string; product: string | null; crm_clients: { name: string } | null } | null };
+  const removed = controls.rows.filter((x) => x.source_settlement_id === id && x.status !== "active");
+  const removedLedger = removed.length ? await financeRows<LedgerRow & { crm_contracts: LineRow["crm_contracts"] }>(u.sb, "fin_ledger", "*,crm_contracts(supply_id,retailer,product,crm_clients(name))", "id", removed.map((x) => x.ledger_id)) : [];
+  // crm_supplies also points back to contracts: batch the exact supply_id rather
+  // than relying on an ambiguous PostgREST relationship.
+  const supplies = await financeRows<{ id: string; cups: string }>(u.sb, "crm_supplies", "id,cups", "id", [...(lines.data ?? []), ...removedLedger].map((l) => (l as LineRow).crm_contracts?.supply_id ?? "").filter(Boolean));
+  const cups = (k: LineRow["crm_contracts"]) => supplies.find((x) => x.id === k?.supply_id)?.cups ?? null;
   return {
     settlement: { ...s, beneficiary_name: n.get(s.beneficiary_id)?.name ?? null, approved_by_name: s.approved_by ? n.get(s.approved_by)?.name ?? null : null, reviewed_by_name: s.reviewed_by ? n.get(s.reviewed_by)?.name ?? null : null, pending: money(D(s.approved_amount ?? s.total_gross).minus(s.paid_amount)) },
-    lines: ((lines.data ?? []) as LineRow[]).map(({ crm_contracts: k, ...l }) => ({ ...l, client_name: k?.crm_clients?.name ?? null, retailer: k?.retailer ?? null })),
+    lines: ((lines.data ?? []) as LineRow[]).map(({ crm_contracts: k, ...l }) => ({ ...l, client_name: k?.crm_clients?.name ?? null, retailer: k?.retailer ?? null, cups: cups(k) })),
+    removed: removed.map((c) => { const l = removedLedger.find((x) => x.id === c.ledger_id); return { ...c, amount: l?.amount ?? "0.00", description: l?.description ?? "", client_name: l?.crm_contracts?.crm_clients?.name ?? null, cups: cups(l?.crm_contracts ?? null), canRestore: !!l && !l.settlement_id }; }),
     payments: pays.data ?? [], audit: audit.data ?? [],
-    permissions: { staff: await finStaff(u), director: u.profile.role === "admin", own: s.beneficiary_id === u.user.id },
+    permissions: { staff: await finStaff(u), editLines: controls.available && await finStaff(u, "edit"), director: u.profile.role === "admin", own: s.beneficiary_id === u.user.id },
   };
 }
 
@@ -690,27 +800,133 @@ export async function settlementPdf(u: U, id: string) {
 
 /* ======================================================================= col·laboradors */
 
+/** Lectures paginades i acotades als identificadors visibles amb la sessió de l'usuari. */
+async function financeRows<T>(sb: SB, table: string, columns: string, key: string, values: string[]): Promise<T[]> {
+  const ids = [...new Set(values.filter(Boolean))];
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += 150) out.push(...await all<T>((from) => sb.from(table).select(columns).in(key, ids.slice(i, i + 150)).range(from, from + 999)));
+  return out;
+}
+
+/** Mateixos fets que `context`, carregats per lots per evitar consultes per client. */
+async function collaboratorContexts(u: U, ids: string[]) {
+  const clientCols = "id,name,kind,owner_id,collaborator_id,origin";
+  const contractCols = "id,client_id,supply_id,retailer,product,status,start_date,end_date,signed_at,owner_id,expedient_id,previous_contract_id";
+  type Exp = NonNullable<Ctx["exp"]> & { contract_id: string | null };
+  const expCols = "id,contract_id,code,service,customer_type,owner_id,collaborator_id,activated_at";
+  const [assigned, directExps] = await Promise.all([
+    financeRows<Ctx["client"]>(u.sb, "crm_clients", clientCols, "collaborator_id", ids),
+    financeRows<Exp>(u.sb, "crm_expedients", expCols, "collaborator_id", ids),
+  ]);
+  const lists = await Promise.all([
+    financeRows<Ctx["contract"]>(u.sb, "crm_contracts", contractCols, "client_id", assigned.map((c) => c.id)),
+    financeRows<Ctx["contract"]>(u.sb, "crm_contracts", contractCols, "id", directExps.map((e) => e.contract_id!).filter(Boolean)),
+    financeRows<Ctx["contract"]>(u.sb, "crm_contracts", contractCols, "expedient_id", directExps.map((e) => e.id)),
+  ]);
+  const contracts = [...new Map(lists.flat().map((k) => [k.id, k])).values()];
+  const ks = contracts.map((k) => k.id);
+  const [clients, supplies, exps, linkedExps, economics] = await Promise.all([
+    financeRows<Ctx["client"]>(u.sb, "crm_clients", clientCols, "id", contracts.map((k) => k.client_id)),
+    financeRows<NonNullable<Ctx["supply"]> & { id: string }>(u.sb, "crm_supplies", "id,cups,energy_type,annual_kwh,power_kw,access_tariff", "id", contracts.map((k) => k.supply_id!).filter(Boolean)),
+    financeRows<Exp>(u.sb, "crm_expedients", expCols, "contract_id", ks),
+    financeRows<Exp>(u.sb, "crm_expedients", expCols, "id", contracts.map((k) => k.expedient_id!).filter(Boolean)),
+    financeRows<NonNullable<Ctx["econ"]> & { contract_id: string }>(u.sb, "fin_contract_economics", "*", "contract_id", ks),
+  ]);
+  const cm = new Map([...assigned, ...clients].map((c) => [c.id, c]));
+  const sm = new Map(supplies.map((s) => [s.id, s]));
+  const em = new Map(economics.map((e) => [e.contract_id, e]));
+  const allExps = [...new Map([...directExps, ...exps, ...linkedExps].map((e) => [e.id, e])).values()];
+  const ctxs: Ctx[] = [];
+  for (const k of contracts) {
+    const client = cm.get(k.client_id); if (!client) continue;
+    const supply = k.supply_id ? sm.get(k.supply_id) ?? null : null;
+    const exp = allExps.find((e) => e.id === k.expedient_id) ?? allExps.find((e) => e.contract_id === k.id) ?? null;
+    const collaborator = exp?.collaborator_id ?? client.collaborator_id;
+    if (!collaborator || !ids.includes(collaborator)) continue;
+    const service: Service | null = exp?.service ?? (supply ? supply.energy_type === "gas" ? "gas" : client.kind === "particular" ? "llum_residencial" : "llum_empresa" : null);
+    ctxs.push({ contract: k, client, supply, exp, econ: em.get(k.id) ?? null, collaborator, owner: k.owner_id ?? exp?.owner_id ?? client.owner_id, service, refDate: exp?.activated_at ?? k.start_date ?? k.signed_at ?? today() });
+  }
+  return { ctxs, assigned };
+}
+
+type CollaboratorCalc = { contract_id: string; beneficiary_id: string; amount: string | null; status: string };
+/** Projecció de lectura: no crea càlculs, meritacions, liquidacions ni pagaments. */
+async function collaboratorProjection(u: U, ids: string[], asOf = today()) {
+  const { ctxs, assigned } = await collaboratorContexts(u, ids);
+  const ks = ctxs.map((c) => c.contract.id);
+  const [rules, ledger, calcs] = await Promise.all([
+    loadRules(u.sb),
+    financeRows<LedgerRow>(u.sb, "fin_ledger", "*", "contract_id", ks),
+    financeRows<CollaboratorCalc & { layer: string; is_current: boolean }>(u.sb, "fin_calculations", "contract_id,beneficiary_id,amount,status,layer,is_current", "contract_id", ks),
+  ]);
+  const rows = ctxs.map((ctx) => {
+    const mine = ledger.filter((l) => l.contract_id === ctx.contract.id);
+    const confirmed = sum(mine.filter((l) => l.layer === "proveidor" && l.kind === "confirmacio").map((l) => l.amount));
+    const f = facts(ctx, D(confirmed).gt(0) ? confirmed : null, D(confirmed).gt(0) ? "confirmat" : null);
+    let amount: string | null = null;
+    const selected = pickRule(rules, f, "collaborador", ctx.collaborator, { initialCollaboratorRateAsOf: today() });
+    let status = selected.conflict.length ? "pendent_configuracio" : selected.rule ? "pendent_dades" : "sense_regla";
+    if (!D(confirmed).gt(0)) {
+      const saved = calcs.find((c) => c.contract_id === ctx.contract.id && c.beneficiary_id === ctx.collaborator && c.layer === "collaborador" && c.is_current && c.status === "calculat");
+      if (saved) { amount = saved.amount; status = saved.status; }
+      else {
+        const provider = pickRule(rules, f, "proveidor", null);
+        const estimate = provider.rule ? computeCommission(provider.rule, f, provider.simulation) : null;
+        if (estimate?.status === "calculat" && estimate.amount != null) { f.providerAmount = estimate.amount; f.providerAmountSource = "estimat"; }
+      }
+    }
+    if (amount == null && selected.rule) {
+      const result = computeCommission(selected.rule, f, selected.simulation);
+      status = result.status; amount = result.status === "calculat" ? result.amount : null;
+    }
+    if ((ctx.econ && ctx.econ.econ_status !== "actiu") || ["anullat", "esborrany"].includes(ctx.contract.status)) { amount = null; status = "exclos"; }
+    const booked = sum(mine.filter((l) => l.layer === "collaborador" && l.beneficiary_id === ctx.collaborator && ["meritacio", "regularitzacio"].includes(l.kind)).map((l) => l.amount));
+    const event = selected.rule?.conditions?.accrual_event ?? "activacio";
+    const eligible = event === "activacio" ? ["actiu", "renovacio_pendent", "finalitzat"].includes(ctx.contract.status) : event === "cobrament_proveidor" && mine.some((l) => l.layer === "proveidor" && l.kind === "cobrament" && D(l.amount).gt(0));
+    const ready = amount != null && status === "calculat" && D(confirmed).gt(0) && eligible && ctx.refDate.slice(0, 10) <= asOf && D(amount).gt(booked);
+    return { ctx, amount, status, confirmed, ready, pending: ready ? money(D(amount!).minus(booked)) : "0.00" };
+  });
+  return { rows, assigned, rules, ledger, calcs };
+}
+
 export async function collaborators(u: U) {
   const n = await names(u.sb);
   const staff = await finStaff(u);
   if (!staff && u.profile.role !== "colaborador") throw new HttpError(403, "Sense permís");
   const ids = staff ? [...n.values()].filter((p) => p.role === "colaborador").map((p) => p.id) : [u.user.id];
-  const [terms, calcs, ledger, sets, clients] = await Promise.all([
-    u.sb.from("fin_collaborator_terms").select("*").in("user_id", ids),
-    u.sb.from("fin_calculations").select("beneficiary_id,amount,status").eq("layer", "collaborador").eq("is_current", true).in("beneficiary_id", ids),
-    u.sb.from("fin_ledger").select("beneficiary_id,kind,amount").eq("layer", "collaborador").in("beneficiary_id", ids),
-    u.sb.from("fin_settlements").select("beneficiary_id,status,approved_amount,paid_amount").eq("kind", "collaborador").in("beneficiary_id", ids),
-    staff ? u.sb.from("crm_clients").select("id,collaborator_id").in("collaborator_id", ids) : Promise.resolve({ data: [] }),
+  const [terms, calcs, ledger, sets, projection, rules] = await Promise.all([
+    financeRows<{ user_id: string; legal_name: string | null; tax_id: string | null; billing_email: string | null; conditions: string | null; active: boolean }>(u.sb, "fin_collaborator_terms", "*", "user_id", ids),
+    financeRows<CollaboratorCalc & { layer: string; is_current: boolean }>(u.sb, "fin_calculations", "contract_id,beneficiary_id,amount,status,layer,is_current", "beneficiary_id", ids),
+    financeRows<LedgerRow>(u.sb, "fin_ledger", "*", "beneficiary_id", ids),
+    financeRows<{ beneficiary_id: string; kind: string; status: string; approved_amount: string | null; paid_amount: string }>(u.sb, "fin_settlements", "beneficiary_id,kind,status,approved_amount,paid_amount", "beneficiary_id", ids),
+    staff ? collaboratorProjection(u, ids) : Promise.resolve(null),
+    !staff ? loadRules(u.sb) : Promise.resolve([] as RuleRow[]),
   ]);
+  const rateRules = projection?.rules ?? rules;
+  const controls = (await commissionControls(u.sb)).rows;
+  const t = today();
   return {
     rows: ids.map((id) => {
-      const L = ((ledger.data ?? []) as { beneficiary_id: string; kind: string; amount: string }[]).filter((x) => x.beneficiary_id === id);
-      const S = ((sets.data ?? []) as { beneficiary_id: string; status: string; approved_amount: string | null; paid_amount: string }[]).filter((x) => x.beneficiary_id === id && ["aprovada", "pagada"].includes(x.status));
+      const allL = ledger.filter((x) => x.layer === "collaborador" && x.beneficiary_id === id);
+      const L = allL.filter((x) => !controls.some((c) => c.ledger_id === x.id && c.status === "cancelled"));
+      const priorPaid = sum(allL.filter((x) => controls.some((c) => c.ledger_id === x.id && c.status === "paid")).map((x) => x.amount));
+      const cancelled = sum(allL.filter((x) => controls.some((c) => c.ledger_id === x.id && c.status === "cancelled" && ["meritacio", "regularitzacio"].includes(x.kind))).map((x) => x.amount));
+      const S = sets.filter((x) => x.kind === "collaborador" && x.beneficiary_id === id && ["aprovada", "pagada"].includes(x.status));
+      const P = projection?.rows.filter((x) => x.ctx.collaborator === id) ?? [];
+      const generalKey = `collab_${id.replace(/-/g, "").slice(0, 16)}`;
+      const applicable = rateRules.filter((r) => r.layer === "collaborador" && r.kind === "pct_comissio_rebuda" && r.beneficiary_id === id && r.valid_from <= t && (!r.valid_to || r.valid_to >= t));
+      const general = applicable.filter((r) => r.rule_key === generalKey).sort((a, b) => Number(b.status === "aprovada") - Number(a.status === "aprovada") || b.version - a.version)[0];
+      const ready = sum(P.map((x) => x.pending));
+      const unsettled = sum(L.filter((x) => !x.settlement_id && pendingCommission(x.id, controls)).map((x) => x.amount));
       return {
-        id, name: n.get(id)?.name ?? "—", email: n.get(id)?.email ?? null, terms: (terms.data ?? []).find((t) => t.user_id === id) ?? null,
-        clients: ((clients.data ?? []) as { collaborator_id: string }[]).filter((c) => c.collaborator_id === id).length,
-        forecast: sum(((calcs.data ?? []) as { beneficiary_id: string; amount: string | null; status: string }[]).filter((c) => c.beneficiary_id === id && c.status === "calculat").map((c) => c.amount)),
-        accrued: sum(L.map((x) => x.amount)), approved: sum(S.map((x) => x.approved_amount)), paid: sum(S.map((x) => x.paid_amount)),
+        id, name: n.get(id)?.name ?? "—", email: n.get(id)?.email ?? null, terms: terms.find((x) => x.user_id === id) ?? null,
+        clients: projection?.assigned.filter((c) => c.collaborator_id === id).length ?? 0,
+        rate: general ? { pct: general.value == null ? null : String(general.value), status: general.status } : null,
+        hasRate: applicable.length > 0,
+        forecast: money(D(projection ? sum(P.map((x) => x.amount)) : sum(calcs.filter((c) => c.layer === "collaborador" && c.is_current && c.beneficiary_id === id && c.status === "calculat").map((c) => c.amount))).minus(cancelled)),
+        forecastIncomplete: P.filter((x) => x.amount == null && x.status !== "exclos").length,
+        ready, pending: money(D(unsettled).plus(ready)), readyContracts: P.filter((x) => x.ready).length,
+        accrued: sum(L.map((x) => x.amount)), approved: sum(S.map((x) => x.approved_amount)), paid: money(D(sum(S.map((x) => x.paid_amount))).plus(priorPaid)),
         balance: money(D(sum(S.map((x) => x.approved_amount))).minus(sum(S.map((x) => x.paid_amount)))),
       };
     }),
@@ -1327,7 +1543,7 @@ export async function collaboratorSplit(u: U, statementId: string) {
     const row: SplitRow = { lineId: l.id, lineNo: l.line_no, contractId: l.contract_id, client: ctx.client.name, base: money(D(l.amount)), collaboratorId: who, collaborator: who ? n.get(who)?.name ?? "—" : null, pct: null, rule: null, simulation: false, collaboratorAmount: null, remainder: money(D(l.amount)), retro: D(l.amount).lt(0), review: false, note: null, forecast: null, accrued: "0.00", settled: "0.00" };
     if (!who) { out.push({ ...row, note: "Sense col·laborador al contracte" }); continue; }
     const f = facts(ctx, money(D(l.amount).abs()), "confirmat");
-    const { rule, simulation, conflict } = pickRule(rules, f, "collaborador", who);
+    const { rule, simulation, conflict, historicalInitialRate } = pickRule(rules, f, "collaborador", who, { initialCollaboratorRateAsOf: today() });
     const [calc, led] = await Promise.all([
       u.sb.from("fin_calculations").select("amount,status").eq("contract_id", l.contract_id).eq("layer", "collaborador").eq("is_current", true).maybeSingle(),
       u.sb.from("fin_ledger").select("amount,settlement_id").eq("contract_id", l.contract_id).eq("layer", "collaborador"),
@@ -1336,13 +1552,13 @@ export async function collaboratorSplit(u: U, statementId: string) {
     row.accrued = sum(((led.data ?? []) as { amount: string }[]).map((x) => x.amount));
     row.settled = sum(((led.data ?? []) as { amount: string; settlement_id: string | null }[]).filter((x) => x.settlement_id).map((x) => x.amount));
     if (conflict.length) { out.push({ ...row, review: true, note: `Conflicte entre ${conflict.length} regles igual d'específiques` }); continue; }
-    if (!rule) { out.push({ ...row, review: true, note: "El col·laborador no té cap percentatge configurat" }); continue; }
+    if (!rule) { out.push({ ...row, review: true, note: `No hi ha cap percentatge aplicable a la data del contracte (${f.refDate.slice(0, 10)}). Revisa la vigència i l'aprovació de les regles del col·laborador.` }); continue; }
     const res = computeCommission(rule, f, simulation);
     const amt = res.amount ? (row.retro ? money(D(res.amount).neg()) : res.amount) : null;
     out.push({
       ...row, pct: rule.kind === "pct_comissio_rebuda" ? D(rule.value ?? 0).toString() : null, rule: rule.name, simulation,
       collaboratorAmount: amt, remainder: amt ? money(D(l.amount).minus(amt)) : row.remainder,
-      review: row.retro || simulation, note: row.retro ? "Retrocessió: import proporcional orientatiu. No es descompta al col·laborador sense revisar l'acord." : simulation ? "Percentatge pendent d'aprovació de Direcció" : null,
+      review: row.retro || simulation, note: [historicalInitialRate ? "Contracte antic: s'aplica el percentatge general inicial aprovat del col·laborador." : null, row.retro ? "Retrocessió: import proporcional orientatiu. No es descompta al col·laborador sense revisar l'acord." : simulation ? "Percentatge pendent d'aprovació de Direcció" : null].filter(Boolean).join(" ") || null,
     });
   }
   const t = (k: "base" | "collaboratorAmount" | "remainder", retro: boolean) => sum(out.filter((x) => x.retro === retro).map((x) => x[k]));
@@ -1382,7 +1598,8 @@ async function scope(u: U, q: z.infer<typeof dashQuery>): Promise<Scope> {
     all<Scope["calcs"][number]>((f) => u.sb.from("fin_calculations").select("contract_id,layer,beneficiary_id,amount,status,created_at").eq("is_current", true).range(f, f + 999)),
     all<LedgerRow>((f) => u.sb.from("fin_ledger").select("*").range(f, f + 999)),
   ]);
-  let L = ledger.filter((l) => (l.contract_id ? contracts.has(l.contract_id) : !q.retailer && !q.product && !q.client && (!q.owner || l.beneficiary_id === q.owner) && (!q.collaborator || l.beneficiary_id === q.collaborator)));
+  const controls = (await commissionControls(u.sb)).rows;
+  let L = ledger.filter((l) => !controls.some((c) => c.ledger_id === l.id && c.status === "cancelled") && (l.contract_id ? contracts.has(l.contract_id) : !q.retailer && !q.product && !q.client && (!q.owner || l.beneficiary_id === q.owner) && (!q.collaborator || l.beneficiary_id === q.collaborator)));
   const C = calcs.filter((c) => contracts.has(c.contract_id));
   if (q.pay) {
     const st = (id: string) => { const col = sum(L.filter((l) => l.contract_id === id && l.kind === "cobrament").map((l) => l.amount)); const exp = sum(L.filter((l) => l.contract_id === id && l.layer === "proveidor" && ["confirmacio", "meritacio"].includes(l.kind)).map((l) => l.amount)); return D(col).lte(0) ? "pendent" : D(col).gte(exp) ? "cobrat" : "parcial"; };
@@ -1417,7 +1634,10 @@ export async function dashboard(u: U, raw: Record<string, string>) {
     const owed = D(sum(rows.filter((l) => l.kind === "confirmacio").map((l) => l.amount))).gt(0) ? sum(rows.filter((l) => ["confirmacio", "retrocessio", "ajustament"].includes(l.kind)).map((l) => l.amount)) : sum(rows.filter((l) => ["meritacio", "regularitzacio", "anullacio"].includes(l.kind)).map((l) => l.amount));
     return { id, pending: money(D(owed).minus(sum(rows.filter((l) => l.kind === "cobrament").map((l) => l.amount)))) };
   }).filter((x) => D(x.pending).gt(0));
-  const unsettled = s.ledger.filter((l) => l.layer !== "proveidor" && !l.settlement_id);
+  const controls = (await commissionControls(u.sb)).rows;
+  const priorPayments = s.ledger.filter((l) => l.layer === "collaborador" && controls.some((c) => c.ledger_id === l.id && c.status === "paid" && inP(c.paid_at))).map((l) => ({ amount: l.amount, paid_at: controls.find((c) => c.ledger_id === l.id)!.paid_at!, fin_settlements: { kind: "collaborador", beneficiary_id: l.beneficiary_id! } }));
+  pays.push(...priorPayments.filter((p) => (!q.owner || p.fin_settlements.beneficiary_id === q.owner) && (!q.collaborator || p.fin_settlements.beneficiary_id === q.collaborator)));
+  const unsettled = s.ledger.filter((l) => l.layer !== "proveidor" && !l.settlement_id && pendingCommission(l.id, controls));
   const months = lastMonths(12);
   const series = months.map((m) => {
     const rows = s.ledger.filter((l) => monthOf(l.period) === m);
@@ -1554,10 +1774,11 @@ export async function myCommissions(u: U) {
   ]);
   type CR = { id: string; contract_id: string; amount: string | null; status: string; formula: string | null; created_at: string; crm_contracts: { retailer: string; product: string | null; crm_clients: { name: string } | null } | null };
   const isCollab = u.profile.role === "colaborador";
+  const controls = (await commissionControls(u.sb)).rows;
   return {
     calculations: ((calcs.data ?? []) as unknown as CR[]).map(({ crm_contracts: k, ...c }) => ({ ...c, formula: isCollab ? null : c.formula, label: k ? `${k.crm_clients?.name ?? "—"} · ${k.retailer}` : "—" })),
-    ledger: ledger.data ?? [],
-    pending: sum(((ledger.data ?? []) as { amount: string; settlement_id: string | null }[]).filter((l) => !l.settlement_id).map((l) => l.amount)),
+    ledger: (ledger.data ?? []).map((l) => ({ ...l, disposition: controls.find((c) => c.ledger_id === l.id) ?? null })),
+    pending: sum(((ledger.data ?? []) as { id: string; amount: string; settlement_id: string | null }[]).filter((l) => !l.settlement_id && pendingCommission(l.id, controls)).map((l) => l.amount)),
     kinds: LEDGER_KIND_LABEL,
   };
 }
@@ -1608,3 +1829,4 @@ export async function financeAutomations(sb: ReturnType<typeof adminClient>, now
   const input = await alertInput(sb, now);
   return planFinanceAlerts({ ...input, now, rules, staffIds });
 }
+

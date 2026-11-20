@@ -9,14 +9,18 @@ import "server-only";
  *   - la importació inicial des de la cartera (només Administració/Direcció).
  */
 import { assertRetailerOperational } from "./retailers";
+import { refreshServiceCommission, setCommissionStatus, syncLines } from "./multiservice";
+import { CONTRACT_SERVICE_LABEL as SERVICE_LABEL_MS, canTransition, isEnergyService, summaryColumns, validateServiceContract, type ContractService, type LineInput } from "@/core/multiservice";
 import {
   activityInput, clientInput, contactInput, incidentInput, contractInput, financeInput, listQuery, safeSearch, supplyInput, taskInput,
-  CONTRACT_STATUS_LABEL, MASKED, maskId, type CrmClientDetail, type CrmContract, type ListQuery,
+  CONTRACT_STATUS_LABEL, MASKED, maskId, type ContractStatus, type CrmClientDetail, type CrmContract, type ListQuery,
 } from "@/core/crm";
 import type { SourceContract } from "@/core/types";
 import { adminClient, HttpError, type requireUser } from "./supabase";
+import { checkConditionsBeforeSave, conditionsFor, hasUnconfirmedConditions, parseConditionsPayload, saveContractConditions } from "./contract-conditions";
 import type { z } from "zod";
-import { clientOwnerIndex } from "./crm-owner-filter";
+import { clientOwnerIndex, clientOwnerIndexFor } from "./crm-owner-filter";
+import { collaboratorNames, collaboratorOptions, matchesCollaborator, sortByCollaborator } from "@/core/client-collaborators";
 
 export type U = Awaited<ReturnType<typeof requireUser>>;
 type PgError = { code?: string; message?: string; details?: string } | null;
@@ -72,14 +76,21 @@ export async function listClients(u: U, raw: Record<string, string>) {
     const cups = s.toUpperCase().replace(/[^A-Z0-9]/g, "");
     query = /^ES\d{4,}/.test(cups) ? query.ilike("cups_list", `%${cups}%`) : query.ilike("search", `%${s}%`);
   }
-  // Match imported owners through each legacy contract (not just crm_clients.collaborator_id).
-  // This also works for cap_partners without a login account, and existing imported clients.
-  const ownerIndex = await clientOwnerIndex(u);
-  if (q.collaborator) {
-    const matching = [...ownerIndex.clientKeys].filter(([, keys]) => q.collaborator === "unlinked" ? [...keys].some(k => k.startsWith("unlinked:") || k.startsWith("ambiguous:")) : keys.has(q.collaborator!)).map(([id]) => id);
-    if (!matching.length) return { rows: [], total: 0, page: q.page, size: q.size, counters: { actiu: 0, potencial: 0, inactiu: 0 } };
-    query = query.in("id", matching);
-  }
+  // Columna, filtre i ordenació consulten la MATEIXA relació (src/core/client-collaborators.ts):
+  // l'assignació del client (collaborator_id) + la de cada contracte. Inclou clients sense contractes.
+  // Rendiment (13/11/2026): la relació completa només cal per FILTRAR o ORDENAR per col·laborador. En la resta de casos
+  // es construeix només per als clients de la pàgina (mateix resultat per a aquestes files). Les lectures independents
+  // (relació, pàgina i comptadors) es llancen alhora en lloc d'una darrere l'altra; les consultes són les mateixes.
+  const needFullIndex = !!q.collaborator || q.sort === "collaborador";
+  const fullIndex = needFullIndex ? clientOwnerIndex(u) : null;
+  fullIndex?.catch(() => undefined);
+  // comptadors globals (clients visibles per a l'usuari)
+  const counter = async (status: string) => {
+    const r = await u.sb.from("crm_clients").select("id", { count: "exact", head: true }).is("archived_at", null).eq("status", status);
+    return r.count ?? 0;
+  };
+  const counters = Promise.all([counter("actiu"), counter("potencial"), counter("inactiu")]);
+  counters.catch(() => undefined);
   if (q.status) query = query.eq("status", q.status);
   if (q.owner === "cap") query = query.is("owner_id", null);
   else if (q.owner && /^[0-9a-f-]{36}$/.test(q.owner)) query = query.eq("owner_id", q.owner);
@@ -89,33 +100,55 @@ export async function listClients(u: U, raw: Record<string, string>) {
   if (q.service === "luz") query = query.gt("luz_count", 0);
   if (q.service === "gas") query = query.gt("gas_count", 0);
   if (q.service === "cap") query = query.eq("supplies_count", 0);
+  type Row = Record<string, unknown> & { id: string; name: string };
   query =
     q.sort === "alta" ? query.order("created_at", { ascending: false })
     : q.sort === "renovacio" ? query.order("next_renewal", { ascending: true, nullsFirst: false }).order("name")
     : q.sort === "activitat" ? query.order("last_activity_at", { ascending: false, nullsFirst: false }).order("name")
     : query.order("name", { ascending: true });
+  let data: Row[] = [], count = 0;
   const from = (q.page - 1) * q.size;
-  const { data, error, count } = await query.range(from, from + q.size - 1);
-  if (error) dbError(error, "No s'han pogut carregar els clients");
-  // comptadors globals (clients visibles per a l'usuari)
-  const counter = async (status: string) => {
-    const r = await u.sb.from("crm_clients").select("id", { count: "exact", head: true }).is("archived_at", null).eq("status", status);
-    return r.count ?? 0;
-  };
-  const [actiu, potencial, inactiu] = await Promise.all([counter("actiu"), counter("potencial"), counter("inactiu")]);
-  return { rows: (data ?? []).map(row => ({ ...row, owner_labels: [...(ownerIndex.clientKeys.get(row.id) ?? [])].map(k => ownerIndex.labels.get(k) ?? k).sort() })), total: count ?? 0, page: q.page, size: q.size, counters: { actiu, potencial, inactiu } };
+  if (q.collaborator || q.sort === "collaborador") {
+    // Filtre i ordre per col·laborador: es recorren els clients visibles (ja filtrats i ordenats per la base de dades),
+    // s'hi aplica la relació única i es pagina després. Així no depèn dels contractes ni de llistes d'identificadors a la URL.
+    let all: Row[] = [];
+    for (let start = 0; ; start += 1000) {
+      const r = await query.order("id").range(start, start + 999);
+      if (r.error) dbError(r.error, "No s'han pogut carregar els clients");
+      all.push(...((r.data ?? []) as unknown as Row[]));
+      if ((r.data ?? []).length < 1000) break;
+    }
+    const full = await fullIndex!;
+    if (q.collaborator) all = all.filter((row) => matchesCollaborator(full.byClient.get(row.id), q.collaborator!));
+    if (q.sort === "collaborador") all = sortByCollaborator(full, all);
+    count = all.length;
+    data = all.slice(from, from + q.size);
+  } else {
+    const r = await query.range(from, from + q.size - 1);
+    if (r.error) dbError(r.error, "No s'han pogut carregar els clients");
+    data = (r.data ?? []) as unknown as Row[];
+    count = r.count ?? 0;
+  }
+  const ownerIndex = fullIndex ? await fullIndex : await clientOwnerIndexFor(u, data.map((row) => row.id));
+  const [actiu, potencial, inactiu] = await counters;
+  // owner_labels es manté per compatibilitat; collaborator_names és el que mostra la columna «Col·laborador».
+  const rows = data.map((row) => { const names = collaboratorNames(ownerIndex, row.id); return { ...row, collaborator_names: names, owner_labels: names }; });
+  return { rows, total: count, page: q.page, size: q.size, counters: { actiu, potencial, inactiu } };
 }
 
 /** Valors existents per als filtres (dels clients que l'usuari pot veure). */
 export async function clientFacets(u: U) {
-  const { data, error } = await u.sb.from("crm_clients").select("city,province,sector,origin").is("archived_at", null).limit(10000);
+  // Rendiment (13/11/2026): les tres lectures són independents i es fan alhora (abans, una darrere l'altra).
+  const indexP = clientOwnerIndex(u);
+  indexP.catch(() => undefined);
+  const [{ data, error }, users] = await Promise.all([
+    u.sb.from("crm_clients").select("city,province,sector,origin").is("archived_at", null).limit(10000),
+    u.sb.from("profiles").select("id,name,role,code").order("name"),
+  ]);
   if (error) dbError(error);
   const uniq = (k: "city" | "province" | "sector" | "origin") => [...new Set((data ?? []).map((r) => (r[k] as string | null)?.trim()).filter((x): x is string => !!x))].sort((a, b) => a.localeCompare(b, "ca"));
-  const users = await u.sb.from("profiles").select("id,name,role,code").order("name");
-  const ownerIndex = await clientOwnerIndex(u);
-  const available = new Set([...ownerIndex.clientKeys.values()].flatMap(keys => [...keys]));
-  const collaborators = [...ownerIndex.labels.entries()].filter(([key]) => available.has(key) && !key.startsWith("unlinked:") && !key.startsWith("ambiguous:")).map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name, "ca"));
-  if ([...available].some(key => key.startsWith("unlinked:") || key.startsWith("ambiguous:"))) collaborators.push({ id: "unlinked", name: "Sense vincular / Revisar" });
+  const ownerIndex = await indexP;
+  const collaborators = collaboratorOptions(ownerIndex, ownerIndex.profiles.filter((p) => p.role === "colaborador").map((p) => p.id));
   return { cities: uniq("city"), provinces: uniq("province"), sectors: uniq("sector"), origins: uniq("origin"), users: users.data ?? [], collaborators };
 }
 
@@ -202,11 +235,11 @@ export async function updateClient(u: U, id: string, raw: unknown) {
 export async function getClient(u: U, id: string): Promise<CrmClientDetail> {
   if (!/^[0-9a-f-]{36}$/.test(id)) throw new HttpError(404, "Client no trobat");
   const sb = u.sb;
-  const c = await sb.from("crm_clients").select("*").eq("id", id).maybeSingle();
-  if (c.error) dbError(c.error);
-  // Mateixa resposta tant si no existeix com si no hi tens accés (no es revela l'existència).
-  if (!c.data) throw new HttpError(404, "Aquest client no existeix o no tens permís per veure'l");
-  const [contacts, assignments, supplies, contracts, documents, activities, tasks, audit, comparisons, incidents, canEdit, canSensitive, profiles] = await Promise.all([
+  // Rendiment (13/11/2026): totes les lectures que només depenen del client es fan en una sola tanda, i les que depenen
+  // dels contractes o dels documents en una segona. Abans eren 10 anades i tornades en sèrie; ara 2. Les consultes, els
+  // filtres, l'ordre i els permisos (RLS de l'usuari) són exactament els mateixos.
+  const [c, contacts, assignments, supplies, contracts, documents, activities, tasks, audit, comparisons, incidents, canEdit, canSensitive, profiles, opps, exps, draftsRes] = await Promise.all([
+    sb.from("crm_clients").select("*").eq("id", id).maybeSingle(),
     sb.from("crm_contacts").select("*").eq("client_id", id).order("is_primary", { ascending: false }).order("name"),
     sb.from("crm_client_assignments").select("user_id,role").eq("client_id", id),
     sb.from("crm_supplies").select("*").eq("client_id", id).order("archived_at", { ascending: true, nullsFirst: true }).order("created_at"),
@@ -220,24 +253,36 @@ export async function getClient(u: U, id: string): Promise<CrmClientDetail> {
     sb.rpc("crm_can_edit_client", { p_client: id }),
     sb.rpc("crm_can_see_sensitive", { p_client: id }),
     sb.from("profiles").select("id,name"),
+    // Oportunitats comercials (Fase 2). Si la migració 009 no s'ha aplicat, simplement no n'hi ha.
+    sb.from("crm_opportunities").select("id,title,service,stage,commission_eur,mwh,owner_id,next_action_at,updated_at").eq("client_id", id).order("updated_at", { ascending: false }),
+    sb.from("crm_expedients").select("id,code,status,service,retailer,product,created_at,activated_at").eq("client_id", id).order("created_at", { ascending: false }),
+    sb.from("comparison_drafts").select("id,context_key,contract_id,crm_supply_id,cups,client_name,step,created_by_name,updated_by_name,updated_at").eq("crm_client_id", id).eq("status", "obert").order("updated_at", { ascending: false }).limit(50),
   ]);
+  if (c.error) dbError(c.error);
+  // Mateixa resposta tant si no existeix com si no hi tens accés (no es revela l'existència).
+  if (!c.data) throw new HttpError(404, "Aquest client no existeix o no tens permís per veure'l");
   for (const r of [contacts, assignments, supplies, contracts, documents, activities, tasks]) if (r.error) dbError(r.error);
   const names = new Map((profiles.data ?? []).map((p) => [p.id as string, p.name as string]));
   const contractIds = (contracts.data ?? []).map((k) => k.id as string);
-  const finance = contractIds.length ? await sb.from("crm_contract_finance").select("*").in("contract_id", contractIds) : { data: [] };
-  const fin = new Map((finance.data ?? []).map((f) => [f.contract_id as string, f]));
-  // Oportunitats comercials (Fase 2). Si la migració 009 no s'ha aplicat, simplement no n'hi ha.
-  const opps = await sb.from("crm_opportunities").select("id,title,service,stage,commission_eur,mwh,owner_id,next_action_at,updated_at").eq("client_id", id).order("updated_at", { ascending: false });
-  const exps = await sb.from("crm_expedients").select("id,code,status,service,retailer,product,created_at,activated_at").eq("client_id", id).order("created_at", { ascending: false });
   const docIdList = (documents.data ?? []).map((d) => d.id as string);
   const docIds = new Set(docIdList);
-  const versions = docIdList.length ? await sb.from("crm_document_versions").select("document_id,version,original_name,size_bytes,uploaded_by_name,created_at").in("document_id", docIdList).order("version", { ascending: false }) : { data: [] };
+  const [finance, linesRes, eventsRes, versions, cond] = await Promise.all([
+    contractIds.length ? sb.from("crm_contract_finance").select("*").in("contract_id", contractIds) : { data: [] },
+    // Multiservei (039): línies de mòbil i historial d'estats. Si la migració no s'ha aplicat, no n'hi ha.
+    contractIds.length ? sb.from("crm_contract_lines").select("*").in("contract_id", contractIds).order("position") : { data: [], error: null },
+    contractIds.length ? sb.from("crm_contract_events").select("id,contract_id,kind,from_status,to_status,note,by_user,at").in("contract_id", contractIds).order("at", { ascending: false }).limit(500) : { data: [], error: null },
+    docIdList.length ? sb.from("crm_document_versions").select("document_id,version,original_name,size_bytes,uploaded_by_name,created_at").in("document_id", docIdList).order("version", { ascending: false }) : { data: [] },
+    // condicions econòmiques contractades (047): si la migració no hi és, la fitxa funciona igual que abans
+    u.profile.role === "colaborador" ? { migrated: true, byContract: {} as Awaited<ReturnType<typeof conditionsFor>>["byContract"] } : conditionsFor(u, contractIds).catch(() => ({ migrated: false, byContract: {} as Awaited<ReturnType<typeof conditionsFor>>["byContract"] })),
+  ]);
+  const fin = new Map((finance.data ?? []).map((f) => [f.contract_id as string, f]));
+  const linesBy = new Map<string, unknown[]>();
+  for (const l of linesRes.error ? [] : linesRes.data ?? []) linesBy.set(l.contract_id as string, [...(linesBy.get(l.contract_id as string) ?? []), l]);
   const byDoc = new Map<string, { version: number; original_name: string; size_bytes: number; uploaded_by_name: string | null; created_at: string }[]>();
   for (const v of versions.data ?? []) if (docIds.has(v.document_id)) byDoc.set(v.document_id, [...(byDoc.get(v.document_id) ?? []), v]);
   const staff = isStaffRole(u.profile.role);
   // DNI/NIE del representant legal: sencer només per a qui pot veure dades sensibles del client
   const clientRow = { ...c.data, legal_rep_tax_id: canSensitive.data ? c.data.legal_rep_tax_id ?? null : maskId(c.data.legal_rep_tax_id) };
-  const draftsRes = await sb.from("comparison_drafts").select("id,context_key,contract_id,crm_supply_id,cups,client_name,step,created_by_name,updated_by_name,updated_at").eq("crm_client_id", id).eq("status", "obert").order("updated_at", { ascending: false }).limit(50);
   const drafts = draftsRes.error ? [] : draftsRes.data ?? [];
   const today = new Date().toISOString().slice(0, 10), in120 = new Date(Date.now() + 120 * 86_400_000).toISOString().slice(0, 10);
   const live = (contracts.data ?? []).filter((k) => ["actiu", "renovacio_pendent"].includes(k.status as string));
@@ -253,7 +298,9 @@ export async function getClient(u: U, id: string): Promise<CrmClientDetail> {
     contacts: contacts.data ?? [],
     assignments: (assignments.data ?? []).map((a) => ({ ...a, name: names.get(a.user_id) ?? null })),
     supplies: supplies.data ?? [],
-    contracts: (contracts.data ?? []).map((k) => ({ ...k, finance: fin.get(k.id) ?? null })) as CrmContract[],
+    contracts: (contracts.data ?? []).map((k) => ({ ...k, finance: fin.get(k.id) ?? null, lines: linesBy.get(k.id as string) ?? [], conditions: cond.byContract[k.id as string] ?? [] })) as CrmContract[],
+    conditionsMigrated: cond.migrated,
+    contractEvents: (eventsRes.error ? [] : eventsRes.data ?? []).map((e) => ({ ...e, by_name: e.by_user ? names.get(e.by_user as string) ?? null : null })),
     documents: (documents.data ?? []).map((d) => ({ ...d, versions: byDoc.get(d.id) ?? [] })),
     activities: activities.data ?? [],
     tasks: tasks.data ?? [],
@@ -299,7 +346,23 @@ export async function assignmentAction(u: U, b: { action: "add" | "remove"; clie
 
 /* ======================================================================= subministraments */
 
-export async function supplyAction(u: U, b: { action: "create" | "update" | "archive" | "restore"; clientId: string; id?: string; data?: unknown }) {
+export async function supplyAction(u: U, b: { action: "create" | "update" | "archive" | "restore" | "delete"; clientId: string; id?: string; data?: unknown }) {
+  if (b.action === "delete") {
+    // eliminar un CUPS creat per error: només si no té cap contracte a l'historial (si en té, primer s'eliminen
+    // o es desvinculen; per treure'l de la vista sense perdre res, l'opció reversible és Arxivar)
+    const cur = await u.sb.from("crm_supplies").select("id,cups").eq("id", b.id!).eq("client_id", b.clientId).maybeSingle();
+    if (!cur.data) throw new HttpError(404, "Subministrament no trobat");
+    const { count } = await u.sb.from("crm_contracts").select("id", { count: "exact", head: true }).eq("supply_id", b.id!);
+    if (count) throw new HttpError(409, `Aquest subministrament té ${count} contracte${count === 1 ? "" : "s"} a l'historial: elimina'ls o canvia'ls de CUPS abans, o bé arxiva el subministrament (reversible).`);
+    const del = await u.sb.from("crm_supplies").delete().eq("id", b.id!).eq("client_id", b.clientId).select("id");
+    if (del.error) {
+      if (del.error.code === "23503") throw new HttpError(409, "Aquest subministrament té dades vinculades que no es poden esborrar: arxiva'l en lloc d'eliminar-lo.");
+      dbError(del.error);
+    }
+    if (!del.data?.length) throw new HttpError(403, "No tens permís per eliminar aquest subministrament (o cal aplicar la migració 040)");
+    await systemActivity(u, b.clientId, "canvi", `Subministrament eliminat: ${cur.data.cups}. Els documents i les comparatives que hi estaven enllaçats es conserven al client.`);
+    return { ok: true };
+  }
   if (b.action === "archive" || b.action === "restore") {
     const { data, error } = await u.sb.from("crm_supplies").update({ archived_at: b.action === "archive" ? new Date().toISOString() : null, status: b.action === "archive" ? "baixa" : "actiu" }).eq("id", b.id!).eq("client_id", b.clientId).select("id");
     if (error) dbError(error);
@@ -344,7 +407,8 @@ export async function publishToRenewals(contractId: string) {
   const { data: k } = await sb.from("crm_contracts").select("*").eq("id", contractId).maybeSingle();
   if (!k) return;
   const id = `crm:${k.id}`;
-  if (!LIVE.includes(k.status) || !k.end_date || k.legacy_contract_id) {
+  // Renovacions (Kanban) és d'energia: fibra, mòbil, assegurances, alarmes o plaques no s'hi publiquen mai
+  if (!LIVE.includes(k.status) || !k.end_date || k.legacy_contract_id || !isEnergyService(k.service ?? null)) {
     await sb.from("contracts").update({ removed_from_source: true }).eq("id", id);
     return;
   }
@@ -372,7 +436,9 @@ export async function publishToRenewals(contractId: string) {
   if (error) console.warn("[crm] no s'ha pogut publicar a renovacions:", error.code);
 }
 
-export async function contractAction(u: U, b: { action: "create" | "update" | "renew" | "finance"; clientId: string; id?: string; data?: unknown }) {
+export async function contractAction(u: U, b: { action: "create" | "update" | "renew" | "finance" | "delete" | "commission"; clientId: string; id?: string; data?: unknown }) {
+  if (b.action === "delete") return deleteContract(u, b.clientId, b.id!);
+  if (b.action === "commission") { await setCommissionStatus(u, b.id!, b.data); return { ok: true }; }
   if (b.action === "finance") {
     if (!isStaffRole(u.profile.role)) throw new HttpError(403, "Només Administració o Direcció poden modificar les dades econòmiques");
     const f = parse(financeInput, b.data);
@@ -381,47 +447,145 @@ export async function contractAction(u: U, b: { action: "create" | "update" | "r
     return { ok: true };
   }
   const k = parse(contractInput, b.data);
+  // condicions econòmiques contractades (047): bloc opcional que acompanya l'alta o l'edició d'un contracte d'energia
+  const cond = parseConditionsPayload((b.data as { conditions_payload?: unknown } | null)?.conditions_payload);
   const staff = isStaffRole(u.profile.role);
+  // Multiservei (039): el servei decideix quines dades s'exigeixen. L'energia continua exactament igual.
+  const prev = b.action === "update" || b.action === "renew"
+    ? (await u.sb.from("crm_contracts").select("id,status,client_id,service,supply_id").eq("id", b.id!).maybeSingle()).data
+    : null;
+  if ((b.action === "update" || b.action === "renew") && (!prev || prev.client_id !== b.clientId)) throw new HttpError(404, "Contracte no trobat");
+  // si no s'indica el servei (formulari d'energia de sempre), el dedueix la base de dades a partir del CUPS
+  const known: ContractService | null = k.service ?? (prev?.service as ContractService | null) ?? null;
+  const energy = isEnergyService(known);
+  const service: ContractService = known ?? "llum_empresa";
+  let ms: { details: Record<string, unknown>; lines: LineInput[] } | null = null;
+  const msCols: Record<string, unknown> = k.service ? { service: k.service } : {};
+  if (!energy) {
+    const v = validateServiceContract({ service, status: k.status, details: k.details, lines: k.lines, supply_id: k.supply_id, retailer: k.retailer, start_date: k.start_date, end_date: k.end_date });
+    if (!v.ok) throw new HttpError(400, [...new Set(v.issues.map((i) => i.message))].join(" · "));
+    ms = { details: v.details, lines: v.lines };
+    const sum = summaryColumns(service, v.details, v.lines, k.start_date ?? null);
+    Object.assign(msCols, { details: v.details, permanence_end: k.permanence_end ?? sum.permanence_end, monthly_eur: k.monthly_eur ?? sum.monthly_eur, provider_ref: k.provider_ref ?? sum.provider_ref, price_type: null, access_tariff: null, supply_id: null });
+    if (sum.retailer) msCols.retailer = sum.retailer;
+    if (!k.product && sum.product) msCols.product = sum.product;
+    if (sum.end_date) msCols.end_date = sum.end_date;
+  }
+  if (b.action === "update" && prev) {
+    const t = canTransition(service, prev.status as ContractStatus, k.status);
+    if (!t.ok && (!staff || !energy)) throw new HttpError(400, t.reason);
+  } else if (!energy) {
+    const t = canTransition(service, null, k.status);
+    if (!t.ok) throw new HttpError(400, t.reason);
+  }
+  if (staff && k.collaborator_id !== undefined) msCols.collaborator_id = k.collaborator_id;
   let supplyCups: string | null = null;
-  if (k.supply_id) {
-    const s = await u.sb.from("crm_supplies").select("id,cups,client_id").eq("id", k.supply_id).maybeSingle();
+  if (k.supply_id && energy) {
+    const s = await u.sb.from("crm_supplies").select("id,cups,client_id,energy_type").eq("id", k.supply_id).maybeSingle();
     if (!s.data || s.data.client_id !== b.clientId) throw new HttpError(400, "El subministrament no és d'aquest client");
     supplyCups = s.data.cups;
+    // el tipus d'energia del CUPS mana: un CUPS de gas no es desa mai com a electricitat (ni a l'inrevés)
+    const fixed = energyServiceFor(known, s.data.energy_type as string | null, (await u.sb.from("crm_clients").select("kind").eq("id", b.clientId).maybeSingle()).data?.kind ?? null);
+    if (fixed && fixed !== known) msCols.service = fixed;
   }
-  const base = { ...k, owner_id: staff ? k.owner_id ?? null : undefined };
-  if (!staff) delete (base as Record<string, unknown>).owner_id;
+  // es comprova TOT abans d'escriure res: un contracte no s'activa amb unes condicions sense confirmar
+  const condPre = energy && cond ? await checkConditionsBeforeSave(u, cond, { liveStatus: LIVE.includes(k.status), supplyId: k.supply_id ?? null, contractId: b.action === "update" ? b.id! : null, status: k.status }) : null;
+  if (energy && !cond && b.action === "update" && LIVE.includes(k.status) && !LIVE.includes(prev?.status as string) && (await hasUnconfirmedConditions(u, b.id!)))
+    throw new HttpError(400, "Abans d'activar el contracte cal confirmar les condicions econòmiques finals pactades amb el client.");
+  const { details: _d, lines: _l, collaborator_id: _c, ...plain } = k; void _d; void _l; void _c;
+  const base: Record<string, unknown> = { ...plain, ...msCols, owner_id: staff ? k.owner_id ?? null : undefined };
+  if (!staff) delete base.owner_id;
+  const retailerName = (base.retailer as string) ?? k.retailer;
 
   if (b.action === "update") {
     const { data, error } = await u.sb.from("crm_contracts").update(base).eq("id", b.id!).eq("client_id", b.clientId).select("id,supply_id,status");
     if (error) dbError(error);
     if (!data?.length) throw new HttpError(403, "No tens permís per modificar aquest contracte");
-    if (k.supply_id && LIVE.includes(k.status)) await u.sb.from("crm_supplies").update({ current_contract_id: b.id }).eq("id", k.supply_id);
-    await publishToRenewals(b.id!);
+    if (ms) await syncLines(u, b.id!, service, ms.lines);
+    if (condPre && cond) await saveContractConditions(u, b.id!, cond, condPre);
+    if (energy) {
+      if (k.supply_id && LIVE.includes(k.status)) await u.sb.from("crm_supplies").update({ current_contract_id: b.id }).eq("id", k.supply_id);
+      await publishToRenewals(b.id!);
+      return { id: b.id!, commission: await autoCommission(u, b.id!, "edicio") };
+    } else {
+      if (prev?.status !== k.status) await systemActivity(u, b.clientId, "canvi", `${SERVICE_LABEL_MS[service]} · ${retailerName}: ${CONTRACT_STATUS_LABEL[prev?.status as ContractStatus] ?? prev?.status} → ${CONTRACT_STATUS_LABEL[k.status]}`, { contract_id: b.id! });
+      await refreshServiceCommission(b.id!);
+    }
     return { id: b.id! };
   }
 
   // create / renew: sempre un registre NOU (l'anterior es conserva a l'historial)
-  let previous: { id: string; status: string } | null = null;
-  if (b.action === "renew") {
-    const p = await u.sb.from("crm_contracts").select("id,status,client_id").eq("id", b.id!).maybeSingle();
-    if (!p.data || p.data.client_id !== b.clientId) throw new HttpError(404, "Contracte anterior no trobat");
-    previous = p.data;
-  }
+  const previous: { id: string; status: string } | null = b.action === "renew" && prev ? { id: prev.id as string, status: prev.status as string } : null;
   // Fase 10: una comercialitzadora desactivada o arxivada no es pot fer servir per a contractes nous
-  await assertRetailerOperational(k.retailer);
-  const legacy = await legacyFor(supplyCups);
+  if (energy) await assertRetailerOperational(k.retailer);
+  const legacy = energy ? await legacyFor(supplyCups) : null;
   const ownerDefault = staff ? k.owner_id ?? null : u.profile.role === "comercial" ? u.user.id : null;
   const { data, error } = await u.sb.from("crm_contracts").insert({ ...base, owner_id: ownerDefault, client_id: b.clientId, previous_contract_id: previous?.id ?? null, legacy_contract_id: legacy, created_by: u.user.id }).select("id").single();
   if (error) dbError(error, "No s'ha pogut crear el contracte");
-  if (previous && LIVE.includes(previous.status) && LIVE.includes(k.status)) {
+  if (ms) await syncLines(u, data.id, service, ms.lines);
+  if (condPre && cond) await saveContractConditions(u, data.id as string, cond, condPre);
+  if (previous && LIVE.includes(previous.status) && (LIVE.includes(k.status) || !energy && k.status === "actiu")) {
     await u.sb.from("crm_contracts").update({ status: "finalitzat" }).eq("id", previous.id);
-    await publishToRenewals(previous.id);
+    if (energy) await publishToRenewals(previous.id);
   }
-  if (k.supply_id && LIVE.includes(k.status)) await u.sb.from("crm_supplies").update({ current_contract_id: data.id, current_retailer: k.retailer }).eq("id", k.supply_id);
+  if (energy && k.supply_id && LIVE.includes(k.status)) await u.sb.from("crm_supplies").update({ current_contract_id: data.id, current_retailer: k.retailer }).eq("id", k.supply_id);
   if (LIVE.includes(k.status)) await u.sb.from("crm_clients").update({ status: "actiu" }).eq("id", b.clientId).eq("status", "potencial");
-  await systemActivity(u, b.clientId, "canvi", `${previous ? "Renovació" : "Nou contracte"}: ${k.retailer}${k.product ? ` · ${k.product}` : ""} (${CONTRACT_STATUS_LABEL[k.status]})`, { contract_id: data.id, supply_id: k.supply_id ?? null });
-  await publishToRenewals(data.id);
+  const what = energy ? "" : `${SERVICE_LABEL_MS[service]} · `;
+  await systemActivity(u, b.clientId, "canvi", `${previous ? "Renovació" : "Nou contracte"}: ${what}${retailerName}${(base.product as string | null) ? ` · ${base.product}` : ""} (${CONTRACT_STATUS_LABEL[k.status]})`, { contract_id: data.id, supply_id: energy ? k.supply_id ?? null : null });
+  if (energy) {
+    await publishToRenewals(data.id);
+    return { id: data.id as string, legacy, commission: await autoCommission(u, data.id as string, previous ? "renovacio" : "alta") };
+  }
+  await refreshServiceCommission(data.id);
   return { id: data.id as string, legacy };
+}
+
+/** Servei d'energia coherent amb el CUPS (null = no s'ha de tocar). */
+function energyServiceFor(known: ContractService | null, energyType: string | null, clientKind: string | null): ContractService | null {
+  if (!energyType || (known && !isEnergyService(known))) return null;
+  if (energyType === "gas") return "gas";
+  if (known === "llum_residencial" || known === "llum_empresa") return known;
+  return known === "gas" ? (clientKind === "particular" ? "llum_residencial" : "llum_empresa") : null;
+}
+
+/**
+ * Comissió automàtica després de desar (vegeu commission-auto.ts). Mai fa fallar el desament. Els imports només es
+ * retornen a qui té accés a les dades econòmiques (Direcció i Administració autoritzada); la resta veu l'estat.
+ */
+async function autoCommission(u: U, contractId: string, source: "alta" | "renovacio" | "edicio") {
+  try {
+    const { autoCalculateContract } = await import("./commission-auto");
+    const r = await autoCalculateContract(u.user.id, contractId, source);
+    const { finStaff } = await import("./permissions");
+    if (await finStaff(u).catch(() => false)) return r;
+    return { state: r.state, message: r.state === "calculat" ? "Comissió calculada automàticament." : r.state === "protegit" ? "Comissió protegida: no s'ha recalculat." : r.message.replace(/\d[\d.,]*\s?€/g, "—") };
+  } catch (e) {
+    console.error("[comissions] càlcul automàtic no disponible:", e instanceof Error ? e.message : e);
+    return { state: "error" as const, message: "El contracte s'ha desat, però la comissió ha quedat pendent de càlcul." };
+  }
+}
+
+/**
+ * Elimina un contracte creat per error. Administració/Direcció poden eliminar-ne qualsevol; un comercial, només
+ * els seus esborranys. Un contracte amb moviments econòmics reals (càlculs, llibre, costos) NO es pot esborrar
+ * (claus foranes ON DELETE RESTRICT): s'anul·la i es conserva la traçabilitat. Els documents es conserven.
+ */
+async function deleteContract(u: U, clientId: string, id: string) {
+  const cur = await u.sb.from("crm_contracts").select("id,status,retailer,product,supply_id").eq("id", id).eq("client_id", clientId).maybeSingle();
+  if (!cur.data) throw new HttpError(404, "Contracte no trobat");
+  if (!isStaffRole(u.profile.role) && cur.data.status !== "esborrany") {
+    throw new HttpError(403, "Només Administració o Direcció poden eliminar un contracte que no és un esborrany. Si ja no ha de comptar, canvia'l a «Anul·lat»: es conserva l'historial.");
+  }
+  const del = await u.sb.from("crm_contracts").delete().eq("id", id).eq("client_id", clientId).select("id");
+  if (del.error) {
+    if (del.error.code === "23503") throw new HttpError(409, "Aquest contracte té moviments econòmics o liquidacions associats i no es pot eliminar: canvia'l a «Anul·lat» (es conserva la traçabilitat econòmica).");
+    dbError(del.error);
+  }
+  if (!del.data?.length) throw new HttpError(403, "No tens permís per eliminar aquest contracte (o cal aplicar la migració 040)");
+  // es retira del Kanban de renovacions si s'hi havia publicat (les targetes de l'Excel no es toquen)
+  await adminClient().from("contracts").update({ removed_from_source: true }).eq("id", `crm:${id}`);
+  await systemActivity(u, clientId, "canvi", `Contracte eliminat: ${cur.data.retailer}${cur.data.product ? ` · ${cur.data.product}` : ""} (${CONTRACT_STATUS_LABEL[cur.data.status as keyof typeof CONTRACT_STATUS_LABEL] ?? cur.data.status}). Els documents enllaçats es conserven a la pestanya Documents.`);
+  return { ok: true, id };
 }
 
 /* ======================================================================= activitat i tasques */

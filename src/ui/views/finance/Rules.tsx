@@ -1,19 +1,24 @@
 "use client";
+import { ServiceRulesPanel } from "./ServiceRules";
+import { IberdrolaCommissionsPanel } from "./IberdrolaCommissions";
+import { CommissionRegularizationPanel } from "./CommissionRegularization";
 /** REGLES DE COMISSIONS: configurables sense codi, versionades i aprovades per Direcció. */
-import { formatUnitValue } from "@/core/units";
+import { commissionUnit, formatUnitValue, unitLabel } from "@/core/units";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Calculator, CheckCircle2, History, PenLine, Plus, ShieldAlert, Trash2 } from "lucide-react";
-import { KINDS, KIND_LABEL, LAYERS, LAYER_LABEL, RULE_STATUS_LABEL, SEGMENTS, SEGMENT_LABEL, UNIT_OF, type Kind, type Layer, type RuleRow } from "@/core/commissions";
+import { KINDS, KIND_LABEL, LAYERS, LAYER_LABEL, POWER_BASES, POWER_BASIS_LABEL, RULE_STATUS_LABEL, SEGMENTS, SEGMENT_LABEL, UNIT_OF, matrixTariffs, parseMatrix, powerBasisOf, type CommissionMatrix, type Kind, type Layer, type RuleRow } from "@/core/commissions";
 import { SERVICES, SERVICE_LABEL } from "@/core/sales";
 import { useApp } from "@/data/store";
 import { Badge, Button, Modal, Notice, Tabs, cn } from "../../components/ui";
 import { eur, fApi, fmtD } from "./api";
+import { MatrixEditor, emptyMatrix } from "./MatrixEditor";
 
 const toast = (title: string, body?: string, tone: "ok" | "err" = "ok") => useApp.getState().toast({ title, body, tone });
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 type Rule = RuleRow & { approved_by_name: string | null; approved_at: string | null; beneficiary_name: string | null; is_seed: boolean };
 type Data = { rules: Rule[]; canManage: boolean; isDirector: boolean; users: { id: string; name: string; role: string }[] };
-const valueText = (r: Pick<RuleRow, "kind" | "value" | "tiers">) => r.kind === "trams_volum" ? (r.tiers ?? []).map((t) => `${t.threshold}→${t.amount} €`).join(" · ") : UNIT_OF[r.kind] === "eur" ? eur(r.value) : formatUnitValue(r.value, UNIT_OF[r.kind]);
+// cap import sense unitat: «50 €/contracte», «8 €/MWh», «2 €/kW», «12,5 %» (una regularització és un import puntual: «€»)
+const valueText = (r: Pick<RuleRow, "kind" | "value" | "tiers" | "conditions">) => r.kind === "taula_iberdrola" ? "Taules Iberdrola 2026 (vegeu el panell)" : r.kind === "matriu_fixa" ? `Matriu · ${matrixTariffs(r.conditions).join(", ") || "sense tarifes"}` : r.kind === "trams_volum" ? (r.tiers ?? []).map((t) => `${t.threshold}→${t.amount} €`).join(" · ") : r.kind === "regularitzacio" ? eur(r.value) : formatUnitValue(r.value, commissionUnit(r.kind, UNIT_OF[r.kind]));
 const STONE: Record<string, "zinc" | "amber" | "green" | "red"> = { esborrany: "zinc", pendent_aprovacio: "amber", aprovada: "green", retirada: "red" };
 
 export function RulesView() {
@@ -48,7 +53,7 @@ export function RulesView() {
               <tr key={r.id} className="border-t border-line align-top">
                 <td className="px-3 py-2"><span className="font-medium">{r.name}</span> <span className="text-muted">v{r.version}</span>{r.notes && <span className="block max-w-[340px] text-[11.5px] text-muted">{r.notes}</span>}{r.base_formula && <span className="block max-w-[340px] text-[11px] text-muted">Base: {r.base_formula}</span>}{UNIT_OF[r.kind] === "pct" && r.kind !== "retrocessio" && !r.base_validated && <span className="mt-0.5 flex items-center gap-1 text-[11.5px] text-pend"><ShieldAlert size={11} /> Pendent de configuració: base no validada</span>}</td>
                 <td className="text-[11.5px]">{[r.retailer, r.product, r.service ? SERVICE_LABEL[r.service] : null, r.segment ? SEGMENT_LABEL[r.segment] : null, r.beneficiary_name].filter(Boolean).join(" · ") || "Tots"}</td>
-                <td className="text-[11.5px]">{KIND_LABEL[r.kind]}{r.kind === "trams_volum" && <span className="block text-muted">{(r.conditions as { metric?: string }).metric === "mwh" ? "MWh" : "contractes"} {(r.conditions as { basis?: string }).basis ?? "activat"}s · {(r.conditions as { policy?: string }).policy === "acumulat" ? "acumulat" : "només el tram més alt"}</span>}</td>
+                <td className="text-[11.5px]">{KIND_LABEL[r.kind]}{r.kind === "matriu_fixa" && (r.conditions as { matrix?: CommissionMatrix }).matrix?.document && <span className="block text-muted">Document: {(r.conditions as { matrix?: CommissionMatrix }).matrix!.document}</span>}{r.kind === "trams_volum" && <span className="block text-muted">{(r.conditions as { metric?: string }).metric === "mwh" ? "MWh" : "contractes"} {(r.conditions as { basis?: string }).basis ?? "activat"}s · {(r.conditions as { policy?: string }).policy === "acumulat" ? "acumulat" : "només el tram més alt"}</span>}</td>
                 <td className="font-medium tnum">{valueText(r)}</td>
                 <td className="text-[11.5px] text-muted">{fmtD(r.valid_from)}{r.valid_to ? ` → ${fmtD(r.valid_to)}` : " →"}</td>
                 <td><Badge tone={STONE[r.status]}>{RULE_STATUS_LABEL[r.status]}</Badge>{r.approved_by_name && <span className="block text-[10.5px] text-muted">{r.approved_by_name}</span>}</td>
@@ -64,6 +69,9 @@ export function RulesView() {
           </table>
         </div>
       )}
+      <ServiceRulesPanel />
+      <IberdrolaCommissionsPanel />
+      {d?.isDirector && <CommissionRegularizationPanel />}
       {edit && d && <RuleForm r={edit === "new" ? null : edit} layer={layer} users={d.users} onClose={() => setEdit(null)} onDone={() => { setEdit(null); void load(); }} />}
       {sim && <Simulator r={sim} onClose={() => setSim(null)} />}
       {hist && d && <Modal open onClose={() => setHist(null)} title={`Versions · ${hist}`}><ul className="space-y-2 text-[12.5px]">{d.rules.filter((r) => r.rule_key === hist).sort((a, b) => b.version - a.version).map((r) => <li key={r.id} className="rounded-xl border border-line p-2.5"><div className="flex items-center gap-2"><b>v{r.version}</b><Badge tone={STONE[r.status]}>{RULE_STATUS_LABEL[r.status]}</Badge><span className="ml-auto tnum">{valueText(r)}</span></div><p className="text-[11.5px] text-muted">{fmtD(r.valid_from)} → {r.valid_to ? fmtD(r.valid_to) : "vigent"}{r.approved_by_name ? ` · aprovada per ${r.approved_by_name} el ${fmtD(r.approved_at)}` : ""}</p></li>)}</ul></Modal>}
@@ -72,28 +80,33 @@ export function RulesView() {
 }
 
 function RuleForm({ r, layer, users, onClose, onDone }: { r: Rule | null; layer: Layer; users: Data["users"]; onClose: () => void; onDone: () => void }) {
-  const c = (r?.conditions ?? {}) as { accrual_event?: string; include_energy?: boolean; include_power?: boolean; metric?: string; basis?: string; policy?: string; months?: number };
+  const c = (r?.conditions ?? {}) as { accrual_event?: string; include_energy?: boolean; include_power?: boolean; metric?: string; basis?: string; policy?: string; months?: number; power_basis?: string };
   const [f, setF] = useState({
     name: r?.name ?? "", layer: r?.layer ?? layer, retailer: r?.retailer ?? "", product: r?.product ?? "", service: r?.service ?? "", segment: r?.segment ?? "", beneficiary_id: r?.beneficiary_id ?? "",
     kind: (r?.kind ?? (layer === "incentiu" ? "trams_volum" : "fix_contracte")) as Kind, value: r?.value != null ? String(Number(r.value)) : "", tiers: (r?.tiers ?? [{ threshold: 5, amount: 50 }]).map((t) => ({ ...t })),
     base_formula: r?.base_formula ?? "", base_validated: r?.base_validated ?? false, valid_from: r?.valid_from ?? new Date().toISOString().slice(0, 10), valid_to: r?.valid_to ?? "", notes: r?.notes ?? "",
     accrual_event: c.accrual_event ?? "activacio", include_energy: c.include_energy !== false, include_power: !!c.include_power, metric: c.metric ?? "contractes", basis: c.basis ?? "activat", policy: c.policy ?? "maxim", months: String(c.months ?? 12),
+    power_basis: (r ? powerBasisOf(r) : null) ?? "",
   });
+  const [matrix, setMatrix] = useState<CommissionMatrix>(() => (r?.conditions as { matrix?: CommissionMatrix } | undefined)?.matrix ?? emptyMatrix());
+  const isMatrix = f.kind === "matriu_fixa";
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const pct = UNIT_OF[f.kind] === "pct";
-  const kinds = f.layer === "incentiu" ? (["trams_volum", "bonificacio"] as Kind[]) : KINDS.filter((k) => k !== "trams_volum");
+  const kinds = f.layer === "incentiu" ? (["trams_volum", "bonificacio"] as Kind[]) : KINDS.filter((k) => k !== "trams_volum" && k !== "taula_iberdrola");   // Iberdrola 2026 es gestiona al seu panell
   const save = async () => {
     setBusy(true); setErr(null);
-    const conditions = f.kind === "trams_volum" ? { metric: f.metric, basis: f.basis, policy: f.policy, period: "mes" } : f.kind === "retrocessio" ? { months: Number(f.months) || 12 } : { accrual_event: f.accrual_event, ...(f.kind === "pct_marge" ? { include_energy: f.include_energy, include_power: f.include_power } : {}) };
+    // es conserven les condicions que no edita el formulari (p. ex. «scheme: nufri» de la matriu comercial)
+    const keep = (r?.conditions ?? {}) as Record<string, unknown>;
+    const conditions = f.kind === "trams_volum" ? { metric: f.metric, basis: f.basis, policy: f.policy, period: "mes" } : f.kind === "retrocessio" ? { months: Number(f.months) || 12 } : { ...keep, accrual_event: f.accrual_event, ...(isMatrix ? { matrix } : {}), ...(f.kind === "pct_marge" ? { include_energy: f.include_energy, include_power: f.include_power } : {}), ...((f.kind === "per_kw" || f.kind === "energia_potencia") && f.power_basis ? { power_basis: f.power_basis } : {}) };
     try {
-      await fApi.act("rule_save", { id: r?.id, data: { name: f.name, layer: f.layer, retailer: f.retailer || null, product: f.product || null, service: f.service || null, segment: f.segment || null, beneficiary_id: f.beneficiary_id || null, kind: f.kind, value: f.kind === "trams_volum" ? null : f.value.replace(",", ".") || null, tiers: f.kind === "trams_volum" ? f.tiers : null, conditions, base_formula: f.base_formula || null, base_validated: f.base_validated, valid_from: f.valid_from, valid_to: f.valid_to || null, notes: f.notes || null } });
+      await fApi.act("rule_save", { id: r?.id, data: { name: f.name, layer: f.layer, retailer: f.retailer || null, product: f.product || null, service: f.service || null, segment: f.segment || null, beneficiary_id: f.beneficiary_id || null, kind: f.kind, value: f.kind === "trams_volum" ? null : isMatrix ? "0" : f.value.replace(",", ".") || null, tiers: f.kind === "trams_volum" ? f.tiers : null, conditions, base_formula: f.base_formula || null, base_validated: f.base_validated, valid_from: f.valid_from, valid_to: f.valid_to || null, notes: f.notes || null } });
       toast(r?.status === "aprovada" ? "S'ha creat una versió nova pendent d'aprovació" : "Regla desada", "Cal que Direcció l'aprovi abans que compti com a definitiva.");
       onDone();
     } catch (e) { setErr(errMsg(e)); } finally { setBusy(false); }
   };
   return (
-    <Modal open onClose={onClose} width="max-w-3xl" title={r ? (r.status === "aprovada" || r.status === "retirada" ? `Nova versió de «${r.name}»` : `Edita «${r.name}»`) : "Nova regla de comissió"} footer={<><Button variant="ghost" onClick={onClose}>Cancel·la</Button><Button variant="primary" disabled={busy || !f.name.trim() || (f.kind !== "trams_volum" && !f.value)} onClick={save}>Desa</Button></>}>
+    <Modal open onClose={onClose} width="max-w-3xl" title={r ? (r.status === "aprovada" || r.status === "retirada" ? `Nova versió de «${r.name}»` : `Edita «${r.name}»`) : "Nova regla de comissió"} footer={<><Button variant="ghost" onClick={onClose}>Cancel·la</Button><Button variant="primary" disabled={busy || !f.name.trim() || (isMatrix ? !parseMatrix({ matrix }).matrix : f.kind !== "trams_volum" && !f.value)} onClick={save}>Desa</Button></>}>
       <div className="grid gap-3 text-[13px] sm:grid-cols-3">
         <label className="block sm:col-span-2"><span className="label">Nom *</span><input className="input" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
         <label className="block"><span className="label">Capa</span><select className="input" value={f.layer} disabled={!!r} onChange={(e) => setF({ ...f, layer: e.target.value as Layer, kind: e.target.value === "incentiu" ? "trams_volum" : "fix_contracte" })}>{LAYERS.map((l) => <option key={l} value={l}>{LAYER_LABEL[l]}</option>)}</select></label>
@@ -103,8 +116,10 @@ function RuleForm({ r, layer, users, onClose, onDone }: { r: Rule | null; layer:
         <label className="block"><span className="label">Segment</span><select className="input" value={f.segment} onChange={(e) => setF({ ...f, segment: e.target.value })}><option value="">Tots</option>{SEGMENTS.map((s) => <option key={s} value={s}>{SEGMENT_LABEL[s]}</option>)}</select></label>
         {f.layer !== "proveidor" && <label className="block"><span className="label">Només per a</span><select className="input" value={f.beneficiary_id} onChange={(e) => setF({ ...f, beneficiary_id: e.target.value })}><option value="">Tothom</option>{users.filter((u) => (f.layer === "collaborador" ? u.role === "colaborador" : u.role === "comercial")).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></label>}
         <label className="block"><span className="label">Tipus</span><select className="input" value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value as Kind })}>{kinds.map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}</select></label>
-        {f.kind !== "trams_volum" && <label className="block"><span className="label">Valor ({UNIT_OF[f.kind] === "pct" ? "%" : UNIT_OF[f.kind] === "eur_mwh" ? "€/MWh" : "€"}) *</span><input className="input tnum" inputMode="decimal" value={f.value} onChange={(e) => setF({ ...f, value: e.target.value })} /></label>}
+        {f.kind !== "trams_volum" && !isMatrix && <label className="block"><span className="label">Valor ({unitLabel(commissionUnit(f.kind, UNIT_OF[f.kind]))}) *</span><input className="input tnum" inputMode="decimal" value={f.value} onChange={(e) => setF({ ...f, value: e.target.value })} /></label>}
         {f.kind !== "trams_volum" && f.kind !== "retrocessio" && <label className="block"><span className="label">Es merita</span><select className="input" value={f.accrual_event} onChange={(e) => setF({ ...f, accrual_event: e.target.value })}><option value="activacio">En activar-se el contracte</option><option value="cobrament_proveidor">Quan cobra Assessoria 3.0</option><option value="manual">Manualment</option></select></label>}
+        {(f.kind === "per_kw" || f.kind === "energia_potencia") && <label className="block"><span className="label">Potència sobre la qual es paga</span><select className="input" value={f.power_basis} onChange={(e) => setF({ ...f, power_basis: e.target.value })}><option value="">Sense confirmar (no calcula)</option>{POWER_BASES.map((b) => <option key={b} value={b}>{POWER_BASIS_LABEL[b]}</option>)}</select></label>}
+        {isMatrix && <MatrixEditor value={matrix} onChange={setMatrix} />}
         {f.kind === "retrocessio" && <label className="block"><span className="label">Termini (mesos des de l&apos;activació)</span><input className="input tnum" value={f.months} onChange={(e) => setF({ ...f, months: e.target.value.replace(/\D/g, "") })} /></label>}
         {f.kind === "trams_volum" && (
           <div className="space-y-2 sm:col-span-3">
@@ -136,10 +151,12 @@ function RuleForm({ r, layer, users, onClose, onDone }: { r: Rule | null; layer:
 }
 
 function Simulator({ r, onClose }: { r: Rule; onClose: () => void }) {
-  const [f, setF] = useState({ eligibleMwh: "200", annualKwh: "", energyIncrementEurKwh: "", powerIncrementEurKwDay: "", powerKw: "", months: "12", providerAmount: "", value: "10" });
+  const [f, setF] = useState({ eligibleMwh: "200", annualKwh: "", energyIncrementEurKwh: "", powerIncrementEurKwDay: "", powerKw: "", months: "12", providerAmount: "", value: "10", tariff: matrixTariffs(r.conditions)[0] ?? "", p6: "" });
   const [res, setRes] = useState<{ status: string; amount: string | null; formula: string; breakdown: { label: string; value: string }[] } | null>(null);
+  const isMatrix = r.kind === "matriu_fixa";
   const run = async () => {
     try {
+      if (isMatrix) { setRes(await fApi.act("simulate", { data: { ruleId: r.id, facts: { retailer: r.retailer ?? "", product: r.product, service: r.service, segment: r.segment, tariff: f.tariff || null, annualKwh: f.annualKwh.replace(/\./g, "").replace(",", ".") || null, powerKw: f.p6 ? [null, null, null, null, null, Number(f.p6.replace(",", "."))] : null } } })); return; }
       setRes(await fApi.act("simulate", { data: { ruleId: r.id, facts: { retailer: r.retailer ?? "", product: r.product, service: r.service, segment: r.segment, eligibleMwh: f.eligibleMwh || null, annualKwh: f.annualKwh || null, energyIncrementEurKwh: f.energyIncrementEurKwh || null, powerIncrementEurKwDay: f.powerIncrementEurKwDay || null, powerKw: f.powerKw ? f.powerKw.split(/[\s;]+/).map(Number) : null, months: Number(f.months) || 12, providerAmount: f.providerAmount || null, value: Number(f.value) } } }));
     } catch (e) { toast("No s'ha pogut simular", errMsg(e), "err"); }
   };
@@ -148,7 +165,11 @@ function Simulator({ r, onClose }: { r: Rule; onClose: () => void }) {
     <Modal open onClose={onClose} title={`Simulador · ${r.name}`} footer={<><Button variant="ghost" onClick={onClose}>Tanca</Button><Button variant="primary" onClick={run}><Calculator size={13} /> Simula</Button></>}>
       <div className="space-y-3 text-[13px]">
         <div className="grid gap-2 sm:grid-cols-3">
-          {r.kind === "trams_volum" ? field("value", "Contractes o MWh del període") : <>{field("eligibleMwh", "MWh elegibles")}{field("annualKwh", "o consum anual (kWh)")}{field("months", "Mesos")}{field("energyIncrementEurKwh", "Increment €/kWh")}{field("powerIncrementEurKwDay", "Increment €/kW·dia")}{field("powerKw", "kW per període (separats per espais)")}{field("providerAmount", "Comissió del proveïdor (€)")}</>}
+          {isMatrix ? <>
+            <label className="block"><span className="label">Tarifa d&apos;accés</span><select className="input" value={f.tariff} onChange={(e) => setF({ ...f, tariff: e.target.value })}>{matrixTariffs(r.conditions).map((t) => <option key={t} value={t}>{t}</option>)}</select></label>
+            {field("annualKwh", "Consum anual total (kWh)")}
+            {(r.conditions as { matrix?: CommissionMatrix }).matrix?.power && field("p6", "Potència contractada P6 (kW)")}
+          </> : r.kind === "trams_volum" ? field("value", "Contractes o MWh del període") : <>{field("eligibleMwh", "MWh elegibles")}{field("annualKwh", "o consum anual (kWh)")}{field("months", "Mesos")}{field("energyIncrementEurKwh", "Increment €/kWh")}{field("powerIncrementEurKwDay", "Increment €/kW·dia")}{field("powerKw", "kW per període (separats per espais)")}{field("providerAmount", "Comissió del proveïdor (€)")}</>}
         </div>
         {res && <div className={cn("rounded-xl border p-3", res.amount ? "border-ren/40 bg-ren/[0.04]" : "border-pend/40 bg-pend/[0.04]")}><p className="text-[18px] font-semibold tnum">{res.amount ? eur(res.amount) : "Sense import"}</p><p className="text-[12px] text-muted">{res.formula}</p><ul className="mt-1 text-[11.5px]">{res.breakdown.map((b, i) => <li key={i}>{b.label}: {b.value}</li>)}</ul><p className="mt-1 text-[11px] text-muted">Simulació aritmètica: no és cap cobrament ni pagament.</p></div>}
       </div>
