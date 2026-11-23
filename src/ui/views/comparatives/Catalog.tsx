@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 import { Archive, Calculator, CheckCircle2, Copy, FileSpreadsheet, Loader2, Pencil, Plug, Plus, RefreshCw, Sparkles, Upload } from "lucide-react";
 import { legacyApi, loadCatalog, serverMode, tariffsApi, type CatalogItem } from "@/comparator/client";
-import { LEGACY_LABEL, checkVersion, fromCrmOffer, newVersionFrom, priceChanged, productKey, type LegacyClass, type LegacyRow } from "@/comparator/catalog";
+import { LEGACY_LABEL, checkVersion, fromCrmOffer, newVersionFrom, latestPerProduct, priceChanged, productKey, type LegacyClass, type LegacyRow } from "@/comparator/catalog";
 import { parseOffersTemplate } from "@/core/offersTemplate";
 import { autoMap, detectHeaderRow, IMPORT_FIELDS, parseCsv, previewImport, type Cell, type ImportField, type ImportPreview, type Mapping } from "@/comparator/tariff-import";
 import { ENERGY_INPUT_UNITS, GAS_FIXED_INPUT_UNITS, fromInternal, normalizeOfferUnits, toInternal } from "@/comparator/units";
@@ -87,9 +87,24 @@ function Tariffs({ staff, onRead }: { staff: boolean; onRead?: () => void }) {
   const [sim, setSim] = useState<OfferVersion | null>(null);
   const [error, setError] = useState<string | null>(null);
   const toast = useApp((s) => s.toast);
-  const load = () => loadCatalog(all).then((r) => { setItems(r.items); if (!r.migrated && serverMode()) setError("Falta executar la migració 006_comparatives_ia.sql: es mostren només les ofertes del CRM."); }).catch((e) => setError(String(e)));
+  const load = () => loadCatalog(true).then((r) => { setItems(r.items); if (!r.migrated && serverMode()) setError("Falta executar la migració 006_comparatives_ia.sql: es mostren només les ofertes del CRM."); }).catch((e) => setError(String(e)));
   useEffect(() => { void load(); }, [all]); // eslint-disable-line react-hooks/exhaustive-deps
-  const shown = useMemo(() => applyOfferFilters(items ?? [], f), [items, f]);
+  // Keep the published version and its pending draft visible together.
+  // latestPerProduct by itself prefers the active version and hides saved edits.
+  const visibleItems = useMemo(() => {
+    if (!items || all) return items ?? [];
+    const selected = latestPerProduct(items);
+    const ids = new Set(selected.map((item) => item.id));
+    const drafts = new Map<string, CatalogItem>();
+    for (const item of items) {
+      if (item.status !== "esborrany") continue;
+      const previous = drafts.get(item.productId);
+      if (!previous || item.version > previous.version) drafts.set(item.productId, item);
+    }
+    for (const draft of drafts.values()) if (!ids.has(draft.id)) selected.push(draft);
+    return selected;
+  }, [items, all]);
+  const shown = useMemo(() => applyOfferFilters(visibleItems, f), [visibleItems, f]);
   const status = async (o: CatalogItem, s: TariffStatus) => {
     try {
       await tariffsApi.status(o.id, s);
@@ -174,6 +189,10 @@ export function PriceCells({ o }: { o: OfferVersion }) {
 }
 
 const n = (s: string) => (s.trim() === "" ? null : Number(s.replace(",", ".")));
+// Stable controlled field: typed changes become part of the saved draft immediately.
+function TariffField({ label, value, onChange, className }: { label: string; value: string | number | null; onChange: (v: string) => void; className?: string }) {
+  return <label className={cn("block", className)}><span className="label">{label}</span><input className="input" value={value ?? ""} onChange={(e) => onChange(e.target.value)} /></label>;
+}
 export function TariffEditor({ offer, onClose, onSaved, onApply }: { offer: OfferVersion; onClose: () => void; onSaved: () => void; onApply?: (o: OfferVersion) => void }) {
   const [o, setO] = useState<OfferVersion>(offer);
   const [busy, setBusy] = useState(false);
@@ -205,9 +224,7 @@ export function TariffEditor({ offer, onClose, onSaved, onApply }: { offer: Offe
       setBusy(false);
     }
   };
-  const In = ({ label, value, onChange, className }: { label: string; value: string | number | null; onChange: (v: string) => void; className?: string }) => (
-    <label className={cn("block", className)}><span className="label">{label}</span><input className="input" defaultValue={value ?? ""} onBlur={(e) => onChange(e.target.value)} /></label>
-  );
+  const In = TariffField;
   return (
     <Modal open onClose={onClose} width="max-w-4xl" title={o.id ? `${o.supplierName} · ${o.productName} (v${o.version})` : "Nova tarifa"}
       footer={onApply ? <><Button variant="ghost" onClick={onClose}>Cancel·la</Button><Button variant="primary" onClick={() => onApply(o)}>Aplica els canvis</Button></> : <><Button variant="ghost" onClick={onClose}>Cancel·la</Button><Button disabled={busy} onClick={() => save("esborrany")}>Desa esborrany</Button><Button variant="primary" disabled={busy || !check.ok || permBlock} onClick={() => save("activa")}>Desa i activa</Button></>}>
